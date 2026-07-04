@@ -65,8 +65,8 @@
     flex:1 1 auto;
     min-height:0;
     display:flex;
-    gap:16px;
-    padding:16px;
+    gap:12px;
+    padding:12px;
   }
 
   @media (max-width: 860px){
@@ -80,16 +80,21 @@
       max-width:none;
     }
     .map-wrap{
-      min-height:52vh;
-      flex:0 0 52vh;
+      min-height:68vh;
+      flex:0 0 68vh;
     }
   }
 
   /* ---------- Map / canvas area ---------- */
+  /* The map takes all horizontal space left of the (narrower) side panel and
+     all available vertical space, with a tall min-height floor so the canvas
+     stays large on any viewport. Terrain regenerates off the real
+     clientWidth/clientHeight, so the bigger canvas is filled automatically. */
   .map-wrap{
     position:relative;
     flex:1 1 auto;
     min-width:0;
+    min-height:72vh;
     border-radius:16px;
     overflow:hidden;
     background:var(--map-bg);
@@ -128,8 +133,8 @@
 
   /* ---------- Side panel ---------- */
   .panel{
-    flex:0 0 320px;
-    width:320px;
+    flex:0 0 300px;
+    width:300px;
     max-width:100%;
     overflow-y:auto;
     overflow-x:hidden;
@@ -433,7 +438,7 @@
             <option value="best" selected>Best (multimodal)</option>
             <option value="highway">&#128663; Highway</option>
             <option value="train">&#128646; Train</option>
-            <option value="boat">&#9974; Boat</option>
+            <option value="boat">&#9972; Boat</option>
             <option value="plane">&#9992; Plane</option>
           </select>
         </label>
@@ -527,7 +532,8 @@
         <div class="legend-grid">
           <span class="legend-chip"><i style="background:#f5a623;"></i>&#128663; Highway</span>
           <span class="legend-chip"><i style="background:#9b6bff;"></i>&#128646; Train</span>
-          <span class="legend-chip"><i style="background:#38bdf8;"></i>&#9974; Boat</span>
+          <span class="legend-chip"><i style="background:#38bdf8;"></i>&#9972; Boat</span>
+          <span class="legend-chip"><i style="background:#38bdf8;"></i>&#9875; Port</span>
           <span class="legend-chip"><i style="background:#ff6b9d;"></i>&#9992; Plane</span>
         </div>
       </div>
@@ -596,7 +602,7 @@
   const MAP_TYPE_VALUES = ['continent', 'islands', 'river', 'mountains', 'flat'];
   const MODE_VALUES = ['best', 'highway', 'train', 'boat', 'plane'];
   const MODE_COLORS = { highway: '#f5a623', train: '#9b6bff', boat: '#38bdf8', plane: '#ff6b9d' };
-  const MODE_GLYPHS = { highway: '🚗', train: '🚆', boat: '⚓', plane: '✈' };
+  const MODE_GLYPHS = { highway: '🚗', train: '🚆', boat: '⛴', plane: '✈' };
 
   // City-count performance ceilings for terrain-aware costing, mirrored in
   // the worker (see the matching constants + comment inside workerSrc). Only
@@ -676,7 +682,8 @@
     seed: 0,
     transportMode: 'best',  // 'best' | 'highway' | 'train' | 'boat' | 'plane'
     pathSegments: null,     // array of per-leg point arrays for the CURRENT best tour, as reported by the worker (terrain-aware routing only)
-    legModes: null          // parallel array of winning-mode strings per leg (only meaningful in 'best' mode)
+    legModes: null,         // parallel array of winning-mode strings per leg (only meaningful in 'best' mode)
+    ports: null             // per-city { x, y, cell, dock } port (nearest water cell) or null if landlocked; main-thread render-only copy, recomputed when cities/terrain change. NOT stored on the frozen city objects (immutability).
   };
 
   // =========================================================================
@@ -712,6 +719,8 @@ let terrain = null;       // {cols, rows, cellSize, cellType, riverMask} or null
 let terrainVersion = 0;   // bumped on every terrain change so per-mode Dijkstra caches invalidate
 let mode = 'best';        // 'best' | 'highway' | 'train' | 'boat' | 'plane'
 let cityCellIdxArr = null; // Int32Array n — which terrain grid cell each city sits in
+let cityPortCellArr = null; // Int32Array n — nearest reachable WATER cell per city (boat embark/dock point), -1 if landlocked
+let cityPortDockArr = null; // Float64Array n — straight over-land distance city -> its port cell center (dock surcharge)
 let modeCache = {};       // { [groundMode]: { terrainVersion, cellCost: Float64Array, perCity: [{dist,prev}, ...] } }
 
 let algo = 'ga';          // 'ga' | '2opt'
@@ -741,7 +750,11 @@ const MODE_NAMES = ['highway', 'train', 'boat', 'plane'];
 const TRAVERSAL = {
   highway: [Infinity, 1.2, 1, 1.8, 2.8, 7],
   train:   [Infinity, 1.3, 1, 1.5, 3.5, 10],
-  boat:    [1, 1.6, Infinity, Infinity, Infinity, Infinity]
+  // Boats travel on WATER ONLY: ocean is passable, every land type (incl.
+  // COAST) is impassable. Rivers are handled separately via RIVER_BOAT_COST
+  // (riverMask overrides cell type in cellTraversalCost). This guarantees no
+  // boat path can ever include a land cell — boats embark/disembark at PORTS.
+  boat:    [1, Infinity, Infinity, Infinity, Infinity, Infinity]
 };
 const RIVER_BRIDGE_COST = { highway: 3, train: 3 }; // crossing a river cell on land = a bridge
 const RIVER_BOAT_COST = 1.2;                        // boats can also sail rivers
@@ -825,6 +838,56 @@ function cellTraversalCost(m, idx) {
   if (m === 'boat') return isRiver ? RIVER_BOAT_COST : TRAVERSAL.boat[type];
   if (isRiver) return RIVER_BRIDGE_COST[m];
   return TRAVERSAL[m][type];
+}
+
+function isWaterCell(idx) {
+  return terrain.cellType[idx] === T_OCEAN || terrain.riverMask[idx] === 1;
+}
+
+// For city i, find its PORT: the nearest WATER cell (ocean or river) via a
+// deterministic outward Chebyshev-ring search from the city's cell — within
+// the first ring that contains any water, the water cell with the smallest
+// straight-line (Euclidean) distance to the city wins, so it's genuinely the
+// nearest. dock = that straight over-land distance (embark surcharge). Returns
+// { cell:-1, dock:Infinity } for a landlocked city (no water reachable). No
+// randomness; the scan order is fixed (top/bottom rows, then left/right cols).
+function computePortForCity(i) {
+  const cols = terrain.cols, rows = terrain.rows, cellSize = terrain.cellSize;
+  const cx = cities[i].x, cy = cities[i].y;
+  let scol = Math.floor(cx / cellSize), srow = Math.floor(cy / cellSize);
+  if (scol < 0) scol = 0; else if (scol >= cols) scol = cols - 1;
+  if (srow < 0) srow = 0; else if (srow >= rows) srow = rows - 1;
+  const maxR = Math.max(cols, rows);
+  const acc = { d: Infinity, idx: -1 };
+  function consider(col, row) {
+    if (col < 0 || row < 0 || col >= cols || row >= rows) return;
+    const idx = row * cols + col;
+    if (!isWaterCell(idx)) return;
+    const wx = (col + 0.5) * cellSize, wy = (row + 0.5) * cellSize;
+    const dd = Math.hypot(wx - cx, wy - cy);
+    if (dd < acc.d) { acc.d = dd; acc.idx = idx; }
+  }
+  for (let r = 0; r <= maxR; r++) {
+    acc.d = Infinity; acc.idx = -1;
+    if (r === 0) { consider(scol, srow); }
+    else {
+      for (let cc = scol - r; cc <= scol + r; cc++) { consider(cc, srow - r); consider(cc, srow + r); }
+      for (let rr = srow - r + 1; rr <= srow + r - 1; rr++) { consider(scol - r, rr); consider(scol + r, rr); }
+    }
+    if (acc.idx !== -1) return { cell: acc.idx, dock: acc.d };
+  }
+  return { cell: -1, dock: Infinity };
+}
+
+function computePorts() {
+  cityPortCellArr = new Int32Array(n).fill(-1);
+  cityPortDockArr = new Float64Array(n).fill(Infinity);
+  if (!terrain) return;
+  for (let i = 0; i < n; i++) {
+    const p = computePortForCity(i);
+    cityPortCellArr[i] = p.cell;
+    cityPortDockArr[i] = p.dock;
+  }
 }
 
 function buildCellCostGrid(m) {
@@ -920,7 +983,15 @@ function ensureModeReady(m) {
   const cellCost = buildCellCostGrid(m);
   const perCity = [];
   if (n <= TERRAIN_DIJKSTRA_CAP) {
-    for (let i = 0; i < n; i++) perCity.push(dijkstraFrom(cityCellIdxArr[i], cellCost));
+    // Boat Dijkstra starts from each city's PORT cell (a water cell), never the
+    // city's own land cell — so the resulting distances/paths stay strictly on
+    // water. Landlocked cities (no port) get a null entry and are unreachable
+    // by boat. All other (ground) modes search from the city's own cell.
+    for (let i = 0; i < n; i++) {
+      const startCell = (m === 'boat') ? cityPortCellArr[i] : cityCellIdxArr[i];
+      if (startCell < 0) { perCity.push(null); continue; }
+      perCity.push(dijkstraFrom(startCell, cellCost));
+    }
   }
   modeCache[m] = { terrainVersion: terrainVersion, cellCost: cellCost, perCity: perCity };
 }
@@ -930,17 +1001,16 @@ function ensureModeReady(m) {
 // of a full per-city Dijkstra. It won't route AROUND obstacles, only price
 // what's actually along the direct line — a reasonable approximation once
 // there are too many cities for N full grid searches to stay fast.
-function lineMarchCost(m, cellCost, i, j) {
-  const a = cities[i], b = cities[j];
+function lineMarchPoints(cellCost, ax, ay, bx, by) {
   const cols = terrain.cols, rows = terrain.rows, cellSize = terrain.cellSize;
-  const dx = b.x - a.x, dy = b.y - a.y;
+  const dx = bx - ax, dy = by - ay;
   const dist = Math.hypot(dx, dy);
   const steps = Math.max(4, Math.min(80, Math.round(dist / cellSize)));
   let total = 0, blocked = 0, prevCost = null;
   for (let s = 0; s <= steps; s++) {
     const t = s / steps;
-    let col = Math.floor((a.x + dx * t) / cellSize);
-    let row = Math.floor((a.y + dy * t) / cellSize);
+    let col = Math.floor((ax + dx * t) / cellSize);
+    let row = Math.floor((ay + dy * t) / cellSize);
     if (col < 0) col = 0; else if (col >= cols) col = cols - 1;
     if (row < 0) row = 0; else if (row >= rows) row = rows - 1;
     const cc = cellCost[row * cols + col];
@@ -951,9 +1021,44 @@ function lineMarchCost(m, cellCost, i, j) {
   if (blocked > steps * 0.3) return UNREACHABLE_PENALTY;
   return total > 0 ? total : dist;
 }
+function lineMarchCost(m, cellCost, i, j) {
+  return lineMarchPoints(cellCost, cities[i].x, cities[i].y, cities[j].x, cities[j].y);
+}
+
+// Large-N boat fallback: march the direct line between the two PORT cell
+// centers over the water-only cost grid, plus both docks. Keeps the priced
+// segment on water (cities themselves are on land) even without a full
+// per-city Dijkstra.
+function boatLineMarchCost(cellCost, i, j) {
+  const pi = cityPortCellArr[i], pj = cityPortCellArr[j];
+  if (pi < 0 || pj < 0) return UNREACHABLE_PENALTY;
+  const cols = terrain.cols, cellSize = terrain.cellSize;
+  const ax = ((pi % cols) + 0.5) * cellSize, ay = (((pi / cols) | 0) + 0.5) * cellSize;
+  const bx = ((pj % cols) + 0.5) * cellSize, by = (((pj / cols) | 0) + 0.5) * cellSize;
+  const water = lineMarchPoints(cellCost, ax, ay, bx, by);
+  if (water >= UNREACHABLE_PENALTY) return UNREACHABLE_PENALTY;
+  return cityPortDockArr[i] + water + cityPortDockArr[j];
+}
 
 function costBetweenGround(m, i, j) {
   const cache = modeCache[m];
+  if (m === 'boat') {
+    // Boat leg A->B = dock(A->portA) + water(portA->portB) + dock(portB->B).
+    // The water segment comes from the port-cell Dijkstra (all-water); if
+    // either city is landlocked, or the two ports sit on separate water bodies
+    // with no all-water route between them, the leg is unreachable — never a
+    // route across land.
+    const pi = cityPortCellArr[i], pj = cityPortCellArr[j];
+    if (pi < 0 || pj < 0) return UNREACHABLE_PENALTY;
+    if (n <= TERRAIN_DIJKSTRA_CAP) {
+      const src = cache.perCity[i];
+      if (!src) return UNREACHABLE_PENALTY;
+      const water = src.dist[pj];
+      if (!isFinite(water)) return UNREACHABLE_PENALTY;
+      return cityPortDockArr[i] + water + cityPortDockArr[j];
+    }
+    return boatLineMarchCost(cache.cellCost, i, j);
+  }
   if (n <= TERRAIN_DIJKSTRA_CAP) {
     const dd = cache.perCity[i].dist[cityCellIdxArr[j]];
     return isFinite(dd) ? dd : UNREACHABLE_PENALTY;
@@ -970,6 +1075,10 @@ function recomputeCosts() {
   if (n > TERRAIN_LINEAPPROX_CAP) return; // see TERRAIN_LINEAPPROX_CAP comment above — falls back to Euclidean
 
   cityCellIdxArr = cityToCellIdx();
+  // Ports are only needed when boats can be used (Boat mode, or Best which
+  // considers boat per leg). computePorts is a per-city ring search, so skip
+  // it for the pure-ground/plane modes that never read it.
+  if (mode === 'best' || mode === 'boat') computePorts();
 
   if (mode === 'plane') {
     const mat = new Float64Array(n * n);
@@ -1024,6 +1133,34 @@ function reconstructPath(m, i, j) {
   if (!cache || !cache.perCity[i]) {
     return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
   }
+
+  // Boat legs are drawn as: dock(city_i -> portA) + the all-water route
+  // (portA -> portB, walked back down the port-cell Dijkstra prev[] chain) +
+  // dock(portB -> city_j). The water polyline is guaranteed to touch only
+  // water cells. Falls back to a straight city-to-city line if a port is
+  // missing or the ports lie on unconnected water bodies (unreachable).
+  if (m === 'boat') {
+    const pi = cityPortCellArr[i], pj = cityPortCellArr[j];
+    if (pi < 0 || pj < 0) return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
+    const bprev = cache.perCity[i].prev;
+    const bcols = terrain.cols, bcellSize = terrain.cellSize;
+    const bpts = [];
+    let bcur = pj, bguard = 0, reached = false;
+    const bcap = terrain.cols * terrain.rows;
+    while (bcur !== -1 && bguard++ < bcap) {
+      const col = bcur % bcols, row = (bcur / bcols) | 0;
+      bpts.push({ x: (col + 0.5) * bcellSize, y: (row + 0.5) * bcellSize });
+      if (bcur === pi) { reached = true; break; }
+      bcur = bprev[bcur];
+    }
+    if (!reached) return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
+    bpts.reverse();
+    const full = [{ x: cities[i].x, y: cities[i].y }];
+    for (let p = 0; p < bpts.length; p++) full.push(bpts[p]);
+    full.push({ x: cities[j].x, y: cities[j].y });
+    return full;
+  }
+
   const prev = cache.perCity[i].prev;
   const cols = terrain.cols, cellSize = terrain.cellSize;
   const startCell = cityCellIdxArr[i], targetCell = cityCellIdxArr[j];
@@ -1656,6 +1793,7 @@ self.onmessage = function (e) {
   function handleCitiesChanged() {
     freezeCities();
     resetRunState();
+    computePorts();
 
     if (state.cities.length >= 2) {
       buildDistanceMatrix();
@@ -1961,6 +2099,48 @@ self.onmessage = function (e) {
     return t.cellType[idx] === TERRAIN_OCEAN || t.riverMask[idx] === 1;
   }
 
+  // Main-thread PORT computation (render-only mirror of the worker's — same
+  // deterministic outward Chebyshev-ring search, same nearest-Euclidean tie-
+  // break). For each city, state.ports[i] = { x, y, cell, dock } for the
+  // nearest reachable water cell (ocean or river), or null if landlocked. Ports
+  // are stored on `state`, never on the frozen city objects, so the city
+  // immutability contract is preserved. Recomputed whenever cities or terrain
+  // change (see handleCitiesChanged / regenerateTerrain). Null on the flat map.
+  function computePorts() {
+    const t = state.terrain;
+    if (!t) { state.ports = null; return; }
+    const cols = t.cols, rows = t.rows, cellSize = t.cellSize;
+    const ports = [];
+    for (let i = 0; i < state.cities.length; i++) {
+      const c = state.cities[i];
+      let scol = Math.floor(c.x / cellSize), srow = Math.floor(c.y / cellSize);
+      if (scol < 0) scol = 0; else if (scol >= cols) scol = cols - 1;
+      if (srow < 0) srow = 0; else if (srow >= rows) srow = rows - 1;
+      const maxR = Math.max(cols, rows);
+      let found = null;
+      let bestD, bx, by, bcell;
+      function consider(col, row) {
+        if (col < 0 || row < 0 || col >= cols || row >= rows) return;
+        const idx = row * cols + col;
+        if (t.cellType[idx] !== TERRAIN_OCEAN && t.riverMask[idx] !== 1) return;
+        const wx = (col + 0.5) * cellSize, wy = (row + 0.5) * cellSize;
+        const dd = Math.hypot(wx - c.x, wy - c.y);
+        if (dd < bestD) { bestD = dd; bx = wx; by = wy; bcell = idx; }
+      }
+      for (let r = 0; r <= maxR && !found; r++) {
+        bestD = Infinity; bcell = -1;
+        if (r === 0) { consider(scol, srow); }
+        else {
+          for (let cc = scol - r; cc <= scol + r; cc++) { consider(cc, srow - r); consider(cc, srow + r); }
+          for (let rr = srow - r + 1; rr <= srow + r - 1; rr++) { consider(scol - r, rr); consider(scol + r, rr); }
+        }
+        if (bcell !== -1) found = { x: bx, y: by, cell: bcell, dock: bestD };
+      }
+      ports.push(found); // null => landlocked
+    }
+    state.ports = ports;
+  }
+
   // When terrain is (re)generated under EXISTING cities, a city that used to
   // sit on land can end up underwater. This scans every city and, for any now
   // on water (ocean or river), relocates it to the CENTER of the nearest land
@@ -2038,8 +2218,9 @@ self.onmessage = function (e) {
     // baseline, so we skip the redundant restart below in that case.
     const citiesRef = state.cities;
     relocateStrandedCities();
-    if (state.cities !== citiesRef) return; // applyCities already restarted everything
+    if (state.cities !== citiesRef) return; // applyCities already restarted everything (incl. ports)
     resetRunState();
+    computePorts(); // terrain changed under fixed cities — refresh port positions
     if (state.cities.length >= 2) {
       if (worker) worker.postMessage({ cmd: 'setTerrain', terrain: serializeTerrainForWorker(state.terrain) });
       else spawnWorker();
@@ -2304,6 +2485,47 @@ self.onmessage = function (e) {
     }
   }
 
+  // Port markers + dashed dock connectors. Only shown when boats can actually
+  // be used (Boat mode, or Best/multimodal which may pick boat per leg) so the
+  // map isn't cluttered with anchors when they're irrelevant. Landlocked
+  // cities (port === null) simply get no marker.
+  function drawPorts() {
+    if (!state.terrain || !state.ports) return;
+    if (state.transportMode !== 'boat' && state.transportMode !== 'best') return;
+    ctx.save();
+    for (let i = 0; i < state.cities.length; i++) {
+      const p = state.ports[i];
+      if (!p) continue;
+      const c = state.cities[i];
+      // dashed dock line city -> port
+      ctx.beginPath();
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = 'rgba(56,189,248,0.5)';
+      ctx.lineWidth = 1;
+      ctx.moveTo(c.x, c.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // port ring
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(10,13,20,0.7)';
+      ctx.arc(p.x, p.y, 6.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(56,189,248,0.9)';
+      ctx.lineWidth = 1.4;
+      ctx.arc(p.x, p.y, 6.5, 0, Math.PI * 2);
+      ctx.stroke();
+      // anchor glyph
+      ctx.font = '9px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#dff2ff';
+      ctx.fillText('⚓', p.x, p.y + 0.5);
+    }
+    ctx.restore();
+  }
+
   function drawCities() {
     for (let idx = 0; idx < state.cities.length; idx++) {
       const c = state.cities[idx];
@@ -2364,6 +2586,7 @@ self.onmessage = function (e) {
       drawTourPath(state.ghostTour, GHOST_COLOR, 1, false);
       drawBestTourRoutes();
     }
+    drawPorts();
     drawCities();
     drawRejectedPulses();
 
