@@ -1,0 +1,1021 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TSP Genetic Solver — Watch Evolution Untangle a Route</title>
+<style>
+  :root{
+    --bg:#0a0d14;
+    --panel-bg:#131826;
+    --panel-bg-2:#161c2c;
+    --map-bg:#0d1220;
+    --text:#e8ecf6;
+    --muted:#8b93a7;
+    --accent:#3fe6cf;
+    --accent-strong:#22ffe0;
+    --start:#ffb454;
+    --danger:#ff6b6b;
+    --stable:#f2c14e;
+    --border:rgba(255,255,255,0.07);
+    --shadow: 0 10px 30px rgba(0,0,0,0.45);
+  }
+
+  *{ box-sizing:border-box; }
+
+  html, body{
+    height:100%;
+    margin:0;
+    overflow-x:hidden;
+  }
+
+  body{
+    display:flex;
+    flex-direction:column;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(63,230,207,0.06), transparent 60%),
+      var(--bg);
+    color:var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  header.topbar{
+    flex:0 0 auto;
+    padding:16px 22px;
+    border-bottom:1px solid var(--border);
+    display:flex;
+    align-items:baseline;
+    gap:12px;
+    flex-wrap:wrap;
+  }
+
+  header.topbar h1{
+    font-size:17px;
+    margin:0;
+    font-weight:700;
+    letter-spacing:0.2px;
+  }
+
+  header.topbar .tagline{
+    font-size:12.5px;
+    color:var(--muted);
+  }
+
+  .app{
+    flex:1 1 auto;
+    min-height:0;
+    display:flex;
+    gap:16px;
+    padding:16px;
+  }
+
+  @media (max-width: 860px){
+    .app{
+      flex-direction:column;
+      overflow-y:auto;
+    }
+    .panel{
+      flex:0 0 auto;
+      width:100%;
+      max-width:none;
+    }
+    .map-wrap{
+      min-height:52vh;
+      flex:0 0 52vh;
+    }
+  }
+
+  /* ---------- Map / canvas area ---------- */
+  .map-wrap{
+    position:relative;
+    flex:1 1 auto;
+    min-width:0;
+    border-radius:16px;
+    overflow:hidden;
+    background:var(--map-bg);
+    box-shadow: inset 0 0 0 1px var(--border), var(--shadow);
+  }
+
+  #mapCanvas{
+    display:block;
+    width:100%;
+    height:100%;
+    cursor:crosshair;
+  }
+
+  .instructions{
+    position:absolute;
+    top:16px;
+    left:50%;
+    transform:translateX(-50%);
+    background:rgba(19,24,38,0.92);
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:10px 18px;
+    font-size:13px;
+    color:var(--text);
+    box-shadow:var(--shadow);
+    pointer-events:none;
+    transition: opacity 0.4s ease, transform 0.4s ease;
+    max-width:90%;
+    text-align:center;
+  }
+  .instructions.hidden{
+    opacity:0;
+    transform:translateX(-50%) translateY(-8px);
+  }
+  .instructions b{ color:var(--accent); }
+
+  /* ---------- Side panel ---------- */
+  .panel{
+    flex:0 0 320px;
+    width:320px;
+    max-width:100%;
+    overflow-y:auto;
+    overflow-x:hidden;
+    border-radius:16px;
+    background:linear-gradient(180deg, var(--panel-bg-2), var(--panel-bg));
+    padding:18px;
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+    box-shadow: inset 0 0 0 1px var(--border), var(--shadow);
+  }
+
+  .section{
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+
+  .section h2{
+    font-size:11px;
+    text-transform:uppercase;
+    letter-spacing:1.1px;
+    color:var(--muted);
+    margin:0;
+    font-weight:700;
+  }
+
+  .btn-row{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+  }
+
+  button{
+    font-family:inherit;
+    font-size:13px;
+    font-weight:600;
+    color:var(--text);
+    background:#1c2337;
+    border:1px solid var(--border);
+    border-radius:9px;
+    padding:9px 13px;
+    cursor:pointer;
+    transition: background 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+  }
+  button:hover{ background:#242c46; }
+  button:active{ transform: translateY(1px); }
+
+  button.primary{
+    background: linear-gradient(135deg, var(--accent), #29b8a6);
+    color:#04231e;
+    border:none;
+    box-shadow: 0 4px 14px rgba(63,230,207,0.25);
+  }
+  button.primary:hover{ filter:brightness(1.06); }
+
+  .row-inline{
+    display:flex;
+    align-items:center;
+    gap:8px;
+  }
+
+  input[type="number"]{
+    width:74px;
+    font-family:inherit;
+    font-size:13px;
+    color:var(--text);
+    background:#0e1422;
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:7px 8px;
+  }
+
+  label.field{
+    display:flex;
+    flex-direction:column;
+    gap:5px;
+    font-size:12.5px;
+    color:var(--muted);
+  }
+
+  .field .field-head{
+    display:flex;
+    justify-content:space-between;
+    color:var(--text);
+    font-size:12.5px;
+  }
+
+  .field .field-head span.val{
+    color:var(--accent);
+    font-variant-numeric:tabular-nums;
+    font-weight:600;
+  }
+
+  input[type="range"]{
+    width:100%;
+    accent-color:var(--accent);
+  }
+
+  .hint{
+    font-size:11px;
+    color:var(--muted);
+    line-height:1.4;
+  }
+
+  /* ---------- Stats ---------- */
+  .stats-grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:10px;
+  }
+
+  .stat-card{
+    background:#0e1422;
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:9px 10px;
+  }
+
+  .stat-card .label{
+    font-size:10.5px;
+    color:var(--muted);
+    text-transform:uppercase;
+    letter-spacing:0.6px;
+  }
+
+  .stat-card .value{
+    font-size:16px;
+    font-weight:700;
+    margin-top:2px;
+    font-variant-numeric:tabular-nums;
+  }
+
+  .badge{
+    display:inline-block;
+    font-size:11.5px;
+    font-weight:700;
+    padding:4px 10px;
+    border-radius:999px;
+    letter-spacing:0.3px;
+  }
+  .badge-idle{ background:rgba(139,147,167,0.18); color:var(--muted); }
+  .badge-improving{ background:rgba(63,230,207,0.16); color:var(--accent); }
+  .badge-stable{ background:rgba(242,193,78,0.16); color:var(--stable); }
+
+  /* ---------- Convergence chart ---------- */
+  .chart-wrap{
+    background:#0e1422;
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:8px;
+    height:90px;
+  }
+  #convergenceChart{
+    width:100%;
+    height:100%;
+    display:block;
+  }
+
+  footer.credit{
+    font-size:10.5px;
+    color:var(--muted);
+    text-align:center;
+    margin-top:auto;
+    padding-top:4px;
+  }
+
+  /* scrollbar polish (webkit) */
+  .panel::-webkit-scrollbar{ width:8px; }
+  .panel::-webkit-scrollbar-thumb{ background:#2a324a; border-radius:8px; }
+  .panel::-webkit-scrollbar-track{ background:transparent; }
+</style>
+</head>
+<body>
+
+  <header class="topbar">
+    <h1>TSP Genetic Solver</h1>
+    <span class="tagline">Genetic algorithm + 2-opt local search — watch the shortest loop untangle itself</span>
+  </header>
+
+  <div class="app">
+    <div class="map-wrap" id="mapWrap">
+      <canvas id="mapCanvas"></canvas>
+      <div class="instructions" id="instructions">
+        Click the map to drop cities, or hit <b>Random Cities</b>, then press <b>Play</b>.
+      </div>
+    </div>
+
+    <aside class="panel">
+
+      <div class="section">
+        <h2>Run</h2>
+        <div class="btn-row">
+          <button class="primary" id="playBtn">&#9654; Play</button>
+          <button id="shuffleBtn">&#8635; Shuffle / Restart</button>
+          <button id="resetBtn">Reset</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>Cities</h2>
+        <div class="row-inline">
+          <button id="randomBtn">Add Random Cities</button>
+          <input type="number" id="randomCount" value="30" min="1" max="1000" step="1">
+        </div>
+        <div class="hint">Click anywhere on the map to drop a single city.</div>
+      </div>
+
+      <div class="section">
+        <h2>Parameters</h2>
+
+        <label class="field">
+          <div class="field-head"><span>Speed (generations / frame)</span><span class="val" id="speedValue">5</span></div>
+          <input type="range" id="speedSlider" min="1" max="50" step="1" value="5">
+        </label>
+
+        <label class="field">
+          <div class="field-head"><span>Population size</span><span class="val" id="popValue">120</span></div>
+          <input type="range" id="popSlider" min="10" max="300" step="1" value="120">
+          <div class="hint">Changing this restarts evolution with a fresh population at the new size.</div>
+        </label>
+
+        <label class="field">
+          <div class="field-head"><span>Mutation rate</span><span class="val" id="mutValue">8%</span></div>
+          <input type="range" id="mutSlider" min="0" max="100" step="1" value="8">
+        </label>
+      </div>
+
+      <div class="section">
+        <h2>Live Stats</h2>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="label">Generation</div>
+            <div class="value" id="statGeneration">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Cities</div>
+            <div class="value" id="statCities">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Best distance</div>
+            <div class="value" id="statBestDist">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Initial distance</div>
+            <div class="value" id="statInitial">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Improved</div>
+            <div class="value" id="statImprovement">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Status</div>
+            <div class="value"><span class="badge badge-idle" id="statBadge">Idle</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>Convergence</h2>
+        <div class="chart-wrap">
+          <canvas id="convergenceChart"></canvas>
+        </div>
+      </div>
+
+      <footer class="credit">Vanilla JS · GA + 2-opt · single file, no dependencies</footer>
+    </aside>
+  </div>
+
+<script>
+(function(){
+  'use strict';
+
+  // =========================================================================
+  // DOM references
+  // =========================================================================
+  const canvas = document.getElementById('mapCanvas');
+  const ctx = canvas.getContext('2d');
+  const mapWrap = document.getElementById('mapWrap');
+  const instructions = document.getElementById('instructions');
+
+  const chartCanvas = document.getElementById('convergenceChart');
+  const chartCtx = chartCanvas.getContext('2d');
+
+  const playBtn = document.getElementById('playBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const randomBtn = document.getElementById('randomBtn');
+  const randomCountInput = document.getElementById('randomCount');
+  const shuffleBtn = document.getElementById('shuffleBtn');
+
+  const speedSlider = document.getElementById('speedSlider');
+  const speedValue = document.getElementById('speedValue');
+  const popSlider = document.getElementById('popSlider');
+  const popValue = document.getElementById('popValue');
+  const mutSlider = document.getElementById('mutSlider');
+  const mutValue = document.getElementById('mutValue');
+
+  const statGeneration = document.getElementById('statGeneration');
+  const statBestDist = document.getElementById('statBestDist');
+  const statCities = document.getElementById('statCities');
+  const statImprovement = document.getElementById('statImprovement');
+  const statInitial = document.getElementById('statInitial');
+  const statBadge = document.getElementById('statBadge');
+
+  // =========================================================================
+  // Global state
+  // =========================================================================
+  const state = {
+    cities: [],            // {x,y} in CSS-pixel coords relative to canvas top-left
+    distMatrix: null,      // flattened Float64Array, n*n, precomputed pairwise distances
+    n: 0,
+    population: [],        // array of permutations (each a plain array of city indices)
+    popSize: parseInt(popSlider.value, 10),
+    mutationRate: parseFloat(mutSlider.value) / 100,
+    gensPerFrame: parseInt(speedSlider.value, 10),
+    generation: 0,
+    bestTour: null,
+    bestDistance: null,
+    initialDistance: null,
+    ghostTour: null,        // snapshot of the best initial (messy) tour, for visual contrast
+    history: [],            // best-distance-per-generation, for the convergence sparkline
+    genSinceImprovement: 0,
+    running: false
+  };
+
+  const TOURNAMENT_K = 5;          // tournament selection pool size
+  const MAX_HISTORY_POINTS = 400;  // cap + decimate to keep chart & memory bounded
+  const ACCENT = '#3fe6cf';
+  const START_COLOR = '#ffb454';
+  const CITY_COLOR = '#e8ecf6';
+  const GHOST_COLOR = 'rgba(150,160,255,0.16)';
+
+  // =========================================================================
+  // Small utilities
+  // =========================================================================
+  function randInt(min, max) { // inclusive both ends
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  function distBetween(p, q) {
+    return Math.hypot(p.x - q.x, p.y - q.y);
+  }
+
+  function shuffleArray(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = randInt(0, i);
+      const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    return arr;
+  }
+
+  function randomTour(n) {
+    const t = [];
+    for (let i = 0; i < n; i++) t.push(i);
+    return shuffleArray(t);
+  }
+
+  // =========================================================================
+  // Distance matrix (precomputed once per city-set change, avoids repeated
+  // sqrt calls across the whole population every generation)
+  // =========================================================================
+  function buildDistanceMatrix() {
+    const n = state.cities.length;
+    const mat = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const dd = distBetween(state.cities[i], state.cities[j]);
+        mat[i * n + j] = dd;
+        mat[j * n + i] = dd;
+      }
+    }
+    state.distMatrix = mat;
+    state.n = n;
+  }
+
+  function d(i, j) {
+    return state.distMatrix[i * state.n + j];
+  }
+
+  function tourDistance(tour) {
+    const n = tour.length;
+    if (n < 2) return 0;
+    let total = 0;
+    for (let k = 0; k < n; k++) {
+      total += d(tour[k], tour[(k + 1) % n]);
+    }
+    return total;
+  }
+
+  // =========================================================================
+  // GA operators
+  // =========================================================================
+
+  // Tournament selection: sample k random individuals, return the fittest
+  // (lowest tour distance) as a parent candidate.
+  function tournamentSelect(population, distances) {
+    let bestIdx = randInt(0, population.length - 1);
+    for (let i = 1; i < TOURNAMENT_K; i++) {
+      const idx = randInt(0, population.length - 1);
+      if (distances[idx] < distances[bestIdx]) bestIdx = idx;
+    }
+    return population[bestIdx];
+  }
+
+  // Order Crossover (OX):
+  //  1. Copy a random contiguous slice [start..end] from parent A verbatim.
+  //  2. Walk parent B starting right after `end` (wrapping around), and drop
+  //     each gene NOT already used into the next open slot of the child,
+  //     also wrapping. Because we only advance the insertion cursor when we
+  //     actually place a gene, the open slots visited are exactly the
+  //     positions outside [start..end], in order — guaranteeing every city
+  //     ends up in the child exactly once (a valid permutation).
+  function orderCrossover(parentA, parentB) {
+    const n = parentA.length;
+    const child = new Array(n).fill(-1);
+    const used = new Set();
+
+    let start = randInt(0, n - 1);
+    let end = randInt(0, n - 1);
+    if (start > end) { const t = start; start = end; end = t; }
+
+    for (let i = start; i <= end; i++) {
+      child[i] = parentA[i];
+      used.add(parentA[i]);
+    }
+
+    let insertPos = (end + 1) % n;
+    for (let offset = 0; offset < n; offset++) {
+      const gene = parentB[(end + 1 + offset) % n];
+      if (!used.has(gene)) {
+        child[insertPos] = gene;
+        used.add(gene);
+        insertPos = (insertPos + 1) % n;
+      }
+    }
+    return child;
+  }
+
+  // Reverse tour[i..j] in place (inclusive). This single move is the core
+  // 2-opt operator: it removes the two edges (i-1,i) and (j,j+1) and
+  // reconnects as (i-1,j) and (i,j+1), which is exactly what "uncrosses"
+  // two overlapping path segments on the map.
+  function reverseSegment(tour, i, j) {
+    while (i < j) {
+      const t = tour[i]; tour[i] = tour[j]; tour[j] = t;
+      i++; j--;
+    }
+  }
+
+  // Mutation: mostly 2-opt segment reversal (this is what visually untangles
+  // crossed edges), occasionally a plain swap for extra diversity.
+  function mutate(tour) {
+    const n = tour.length;
+    if (n < 2) return tour;
+    if (n >= 4 && Math.random() < 0.75) {
+      const i = randInt(0, n - 2);
+      const j = randInt(i + 1, n - 1);
+      reverseSegment(tour, i, j);
+    } else {
+      const i = randInt(0, n - 1);
+      const j = randInt(0, n - 1);
+      const t = tour[i]; tour[i] = tour[j]; tour[j] = t;
+    }
+    return tour;
+  }
+
+  // Light 2-opt local-search pass applied directly to the elite each
+  // generation. Tries a handful of random 2-opt moves and only keeps ones
+  // that shrink the tour, using an O(1) delta (no full O(n) recompute).
+  //
+  // Edge case: if the sampled segment spans the ENTIRE tour (i=0 and
+  // j=n-1), the "outside" neighbors collapse onto the segment's own
+  // endpoints, which would corrupt the delta math (self-distances are 0).
+  // Reversing the whole tour is a no-op for a closed loop anyway, so we
+  // just skip that combination.
+  function twoOptImprove(tour, currentDist, attempts) {
+    const n = tour.length;
+    if (n < 4) return currentDist;
+    let dist = currentDist;
+    for (let a = 0; a < attempts; a++) {
+      const i = randInt(0, n - 2);
+      const j = randInt(i + 1, n - 1);
+      if (i === 0 && j === n - 1) continue; // whole-tour reversal: no-op, skip
+
+      const pa = tour[(i - 1 + n) % n];
+      const pb = tour[i];
+      const pc = tour[j];
+      const pn = tour[(j + 1) % n];
+
+      const before = d(pa, pb) + d(pc, pn);
+      const after = d(pa, pc) + d(pb, pn);
+      const delta = after - before;
+
+      if (delta < -1e-9) {
+        reverseSegment(tour, i, j);
+        dist += delta;
+      }
+    }
+    return dist;
+  }
+
+  // =========================================================================
+  // Population / evolution lifecycle
+  // =========================================================================
+  function initPopulation() {
+    const n = state.cities.length;
+    const pop = [];
+    for (let i = 0; i < state.popSize; i++) pop.push(randomTour(n));
+    state.population = pop;
+  }
+
+  // Rebuilds the population from scratch and resets all run stats. Used
+  // whenever the city set changes (add/random/reset) AND for the explicit
+  // Shuffle/Restart action (which keeps the cities but starts fresh).
+  function resetEvolutionState() {
+    state.generation = 0;
+    state.history = [];
+    state.genSinceImprovement = 0;
+    state.bestDistance = null;
+    state.initialDistance = null;
+    state.bestTour = null;
+    state.ghostTour = null;
+
+    if (state.cities.length >= 2) {
+      buildDistanceMatrix();
+      initPopulation();
+      const distances = state.population.map(tourDistance);
+      let bestIdx = 0;
+      for (let i = 1; i < distances.length; i++) {
+        if (distances[i] < distances[bestIdx]) bestIdx = i;
+      }
+      state.bestTour = state.population[bestIdx].slice();
+      state.bestDistance = distances[bestIdx];
+      state.initialDistance = distances[bestIdx];
+      state.ghostTour = state.population[bestIdx].slice();
+    } else {
+      state.distMatrix = null;
+      state.n = state.cities.length;
+      state.population = [];
+    }
+  }
+
+  function pushHistory(distValue) {
+    state.history.push(distValue);
+    if (state.history.length > MAX_HISTORY_POINTS) {
+      const decimated = [];
+      for (let i = 0; i < state.history.length; i += 2) decimated.push(state.history[i]);
+      state.history = decimated;
+    }
+  }
+
+  // Advance the GA by exactly one generation.
+  function evolveOneGeneration() {
+    if (state.cities.length < 2 || state.population.length === 0) return;
+
+    const distances = state.population.map(tourDistance);
+    let eliteIdx = 0;
+    for (let i = 1; i < distances.length; i++) {
+      if (distances[i] < distances[eliteIdx]) eliteIdx = i;
+    }
+
+    let eliteTour = state.population[eliteIdx].slice();
+    let eliteDist = distances[eliteIdx];
+
+    // Extra local-search polish on the elite (see twoOptImprove docs above).
+    const attempts = Math.min(60, Math.max(10, state.n));
+    eliteDist = twoOptImprove(eliteTour, eliteDist, attempts);
+
+    // Elitism: the (possibly 2-opt-improved) elite goes straight into the
+    // next generation untouched by crossover/mutation.
+    const newPopulation = [eliteTour.slice()];
+    while (newPopulation.length < state.popSize) {
+      const parentA = tournamentSelect(state.population, distances);
+      const parentB = tournamentSelect(state.population, distances);
+      let child = orderCrossover(parentA, parentB);
+      if (Math.random() < state.mutationRate) child = mutate(child);
+      newPopulation.push(child);
+    }
+    state.population = newPopulation;
+    state.generation++;
+
+    if (state.bestDistance === null || eliteDist < state.bestDistance - 1e-9) {
+      state.genSinceImprovement = 0;
+    } else {
+      state.genSinceImprovement++;
+    }
+    state.bestDistance = eliteDist;
+    state.bestTour = eliteTour;
+    pushHistory(eliteDist);
+  }
+
+  // =========================================================================
+  // Canvas sizing (device-pixel-ratio aware, absolute city coords)
+  // =========================================================================
+  function fitCanvasToContainer(cnv) {
+    const rect = cnv.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+    if (cnv.width !== w) cnv.width = w;
+    if (cnv.height !== h) cnv.height = h;
+    const c = cnv.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function resizeAll() {
+    fitCanvasToContainer(canvas);
+    fitCanvasToContainer(chartCanvas);
+  }
+
+  if (window.ResizeObserver) {
+    new ResizeObserver(resizeAll).observe(mapWrap);
+    new ResizeObserver(resizeAll).observe(chartCanvas.parentElement);
+  }
+  window.addEventListener('resize', resizeAll);
+
+  // =========================================================================
+  // Rendering: main map
+  // =========================================================================
+  function drawGrid(w, h) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.035)';
+    ctx.lineWidth = 1;
+    const step = 40;
+    for (let x = 0; x < w; x += step) {
+      ctx.beginPath(); ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, h); ctx.stroke();
+    }
+    for (let y = 0; y < h; y += step) {
+      ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(w, y + 0.5); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawTourPath(tour, color, lineWidth, glow) {
+    if (!tour || tour.length < 2) return;
+    ctx.beginPath();
+    for (let k = 0; k < tour.length; k++) {
+      const c = state.cities[tour[k]];
+      if (!c) return;
+      if (k === 0) ctx.moveTo(c.x, c.y); else ctx.lineTo(c.x, c.y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    if (glow) { ctx.shadowColor = color; ctx.shadowBlur = 14; } else { ctx.shadowBlur = 0; }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  function drawCities() {
+    for (let idx = 0; idx < state.cities.length; idx++) {
+      const c = state.cities[idx];
+      const isStart = idx === 0;
+      ctx.beginPath();
+      ctx.shadowColor = isStart ? START_COLOR : CITY_COLOR;
+      ctx.shadowBlur = isStart ? 16 : 9;
+      ctx.fillStyle = isStart ? START_COLOR : CITY_COLOR;
+      ctx.arc(c.x, c.y, isStart ? 6 : 4.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      if (isStart) {
+        ctx.beginPath();
+        ctx.strokeStyle = START_COLOR;
+        ctx.lineWidth = 2;
+        ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawCenteredText(text, w, h, sub) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(232,236,246,0.55)';
+    ctx.font = '600 15px -apple-system, Segoe UI, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, w / 2, sub ? h / 2 - 10 : h / 2);
+    if (sub) {
+      ctx.font = '400 12px -apple-system, Segoe UI, sans-serif';
+      ctx.fillStyle = 'rgba(232,236,246,0.35)';
+      ctx.fillText(sub, w / 2, h / 2 + 14);
+    }
+    ctx.restore();
+  }
+
+  function render() {
+    const w = canvas.clientWidth || 1;
+    const h = canvas.clientHeight || 1;
+    ctx.clearRect(0, 0, w, h);
+    drawGrid(w, h);
+
+    if (state.cities.length >= 2) {
+      drawTourPath(state.ghostTour, GHOST_COLOR, 1, false);
+      drawTourPath(state.bestTour, ACCENT, 2.5, true);
+    }
+    drawCities();
+
+    if (state.cities.length === 0) {
+      drawCenteredText('Click anywhere to drop your first city', w, h);
+    } else if (state.cities.length < 3) {
+      drawCenteredText('Add at least 3 cities for an interesting route', w, h, '(2 cities gives a trivial there-and-back tour)');
+    }
+  }
+
+  // =========================================================================
+  // Rendering: convergence sparkline
+  // =========================================================================
+  function renderChart() {
+    const w = chartCanvas.clientWidth || 1;
+    const h = chartCanvas.clientHeight || 1;
+    chartCtx.clearRect(0, 0, w, h);
+
+    const hist = state.history;
+    if (hist.length < 2) {
+      chartCtx.fillStyle = 'rgba(139,147,167,0.6)';
+      chartCtx.font = '11px -apple-system, Segoe UI, sans-serif';
+      chartCtx.fillText('Waiting for data…', 6, h / 2 + 4);
+      return;
+    }
+
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < hist.length; i++) {
+      if (hist[i] < min) min = hist[i];
+      if (hist[i] > max) max = hist[i];
+    }
+    if (max === min) max = min + 1;
+
+    // filled area under the curve
+    chartCtx.beginPath();
+    for (let i = 0; i < hist.length; i++) {
+      const x = (i / (hist.length - 1)) * w;
+      const y = h - ((hist[i] - min) / (max - min)) * (h - 6) - 3;
+      if (i === 0) chartCtx.moveTo(x, y); else chartCtx.lineTo(x, y);
+    }
+    chartCtx.lineTo(w, h);
+    chartCtx.lineTo(0, h);
+    chartCtx.closePath();
+    chartCtx.fillStyle = 'rgba(63,230,207,0.10)';
+    chartCtx.fill();
+
+    // stroke line
+    chartCtx.beginPath();
+    for (let i = 0; i < hist.length; i++) {
+      const x = (i / (hist.length - 1)) * w;
+      const y = h - ((hist[i] - min) / (max - min)) * (h - 6) - 3;
+      if (i === 0) chartCtx.moveTo(x, y); else chartCtx.lineTo(x, y);
+    }
+    chartCtx.strokeStyle = ACCENT;
+    chartCtx.lineWidth = 1.5;
+    chartCtx.stroke();
+  }
+
+  // =========================================================================
+  // Stats UI
+  // =========================================================================
+  function updateStatsUI() {
+    statGeneration.textContent = state.generation;
+    statCities.textContent = state.cities.length;
+    statBestDist.textContent = state.bestDistance != null ? state.bestDistance.toFixed(1) : '—';
+    statInitial.textContent = state.initialDistance != null ? state.initialDistance.toFixed(1) : '—';
+
+    if (state.initialDistance != null && state.bestDistance != null && state.initialDistance > 0) {
+      const pct = (1 - state.bestDistance / state.initialDistance) * 100;
+      statImprovement.textContent = pct.toFixed(1) + '%';
+    } else {
+      statImprovement.textContent = '—';
+    }
+
+    let badgeText, badgeClass;
+    if (state.cities.length < 2) {
+      badgeText = 'Idle'; badgeClass = 'badge-idle';
+    } else if (state.genSinceImprovement < 15) {
+      badgeText = 'Improving'; badgeClass = 'badge-improving';
+    } else {
+      badgeText = 'Stable (' + state.genSinceImprovement + ' gens)'; badgeClass = 'badge-stable';
+    }
+    statBadge.textContent = badgeText;
+    statBadge.className = 'badge ' + badgeClass;
+  }
+
+  // =========================================================================
+  // UI wiring
+  // =========================================================================
+  function hideInstructions() { instructions.classList.add('hidden'); }
+  function showInstructions() { instructions.classList.remove('hidden'); }
+
+  function updatePlayButton() {
+    playBtn.innerHTML = state.running ? '&#10074;&#10074; Pause' : '&#9654; Play';
+  }
+
+  canvas.addEventListener('click', function (e) {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    state.cities.push({ x: x, y: y });
+    hideInstructions();
+    resetEvolutionState();
+  });
+
+  playBtn.addEventListener('click', function () {
+    state.running = !state.running;
+    updatePlayButton();
+    hideInstructions();
+  });
+
+  resetBtn.addEventListener('click', function () {
+    state.cities = [];
+    state.running = false;
+    updatePlayButton();
+    resetEvolutionState();
+    showInstructions();
+  });
+
+  randomBtn.addEventListener('click', function () {
+    let count = parseInt(randomCountInput.value, 10);
+    if (!Number.isFinite(count) || count < 1) count = 30;
+    count = Math.min(count, 2000);
+
+    const w = canvas.clientWidth || 600;
+    const h = canvas.clientHeight || 400;
+    const margin = 30;
+    const usableW = Math.max(1, w - margin * 2);
+    const usableH = Math.max(1, h - margin * 2);
+
+    for (let i = 0; i < count; i++) {
+      let x, y, tries = 0, ok = false;
+      while (!ok && tries < 5) {
+        x = margin + Math.random() * usableW;
+        y = margin + Math.random() * usableH;
+        ok = true;
+        for (let k = 0; k < state.cities.length; k++) {
+          const c = state.cities[k];
+          if (Math.abs(c.x - x) < 4 && Math.abs(c.y - y) < 4) { ok = false; break; }
+        }
+        tries++;
+      }
+      state.cities.push({ x: x, y: y });
+    }
+    hideInstructions();
+    resetEvolutionState();
+  });
+
+  shuffleBtn.addEventListener('click', function () {
+    resetEvolutionState();
+  });
+
+  speedSlider.addEventListener('input', function () {
+    state.gensPerFrame = parseInt(speedSlider.value, 10);
+    speedValue.textContent = speedSlider.value;
+  });
+
+  popSlider.addEventListener('input', function () {
+    state.popSize = parseInt(popSlider.value, 10);
+    popValue.textContent = popSlider.value;
+    resetEvolutionState();
+  });
+
+  mutSlider.addEventListener('input', function () {
+    state.mutationRate = parseFloat(mutSlider.value) / 100;
+    mutValue.textContent = mutSlider.value + '%';
+  });
+
+  // =========================================================================
+  // Main loop
+  // =========================================================================
+  function animate() {
+    requestAnimationFrame(animate);
+    if (state.running && state.cities.length >= 2) {
+      for (let i = 0; i < state.gensPerFrame; i++) evolveOneGeneration();
+    }
+    render();
+    renderChart();
+    updateStatsUI();
+  }
+
+  // =========================================================================
+  // Boot
+  // =========================================================================
+  resizeAll();
+  resetEvolutionState();
+  updatePlayButton();
+  updateStatsUI();
+  requestAnimationFrame(animate);
+
+})();
+</script>
+
+</body>
+</html>
