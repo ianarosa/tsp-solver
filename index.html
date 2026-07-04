@@ -203,6 +203,18 @@
     padding:7px 8px;
   }
 
+  select{
+    font-family:inherit;
+    font-size:13px;
+    color:var(--text);
+    background:#0e1422;
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:7px 8px;
+    cursor:pointer;
+    max-width:100%;
+  }
+
   label.field{
     display:flex;
     flex-direction:column;
@@ -261,6 +273,19 @@
     font-weight:700;
     margin-top:2px;
     font-variant-numeric:tabular-nums;
+  }
+
+  .compare-grid{
+    grid-template-columns:1fr 1fr 1fr;
+  }
+
+  .stat-card.active{
+    border-color:var(--accent);
+    box-shadow:0 0 0 1px var(--accent) inset;
+  }
+
+  .stat-card .value.small{
+    font-size:13.5px;
   }
 
   .badge{
@@ -322,6 +347,14 @@
 
       <div class="section">
         <h2>Run</h2>
+        <label class="field">
+          <div class="field-head"><span>Algorithm</span></div>
+          <select id="algoSelect">
+            <option value="ga" selected>Genetic Algorithm</option>
+            <option value="2opt">2-opt (greedy local search)</option>
+            <option value="nn">Nearest Neighbor (baseline)</option>
+          </select>
+        </label>
         <div class="btn-row">
           <button class="primary" id="playBtn">&#9654; Play</button>
           <button id="shuffleBtn">&#8635; Shuffle / Restart</button>
@@ -336,6 +369,20 @@
           <input type="number" id="randomCount" value="30" min="1" max="1000" step="1">
         </div>
         <div class="hint">Click anywhere on the map to drop a single city.</div>
+        <div class="row-inline">
+          <select id="presetSelect">
+            <option value="custom" selected>Preset…</option>
+            <option value="circle">Circle</option>
+            <option value="grid">Grid</option>
+            <option value="clusters">Random clusters</option>
+            <option value="spiral">Spiral</option>
+          </select>
+        </div>
+        <div class="hint">Presets replace the current cities and restart evolution.</div>
+        <div class="row-inline">
+          <button id="copyLinkBtn">Copy Link</button>
+        </div>
+        <div class="hint">Copies a URL that reproduces the exact same cities.</div>
       </div>
 
       <div class="section">
@@ -386,6 +433,21 @@
             <div class="value"><span class="badge badge-idle" id="statBadge">Idle</span></div>
           </div>
         </div>
+        <div class="hint" style="margin-top:2px;">Algorithm comparison (same city set)</div>
+        <div class="stats-grid compare-grid">
+          <div class="stat-card" id="compareCardGA">
+            <div class="label">GA</div>
+            <div class="value small" id="statCompareGA">—</div>
+          </div>
+          <div class="stat-card" id="compareCardTwoOpt">
+            <div class="label">2-opt</div>
+            <div class="value small" id="statCompareTwoOpt">—</div>
+          </div>
+          <div class="stat-card" id="compareCardNN">
+            <div class="label">NN</div>
+            <div class="value small" id="statCompareNN">—</div>
+          </div>
+        </div>
       </div>
 
       <div class="section">
@@ -395,7 +457,7 @@
         </div>
       </div>
 
-      <footer class="credit">Vanilla JS · GA + 2-opt · single file, no dependencies</footer>
+      <footer class="credit">Vanilla JS · GA + 2-opt + NN · Web Worker · single file, no dependencies</footer>
     </aside>
   </div>
 
@@ -419,6 +481,9 @@
   const randomBtn = document.getElementById('randomBtn');
   const randomCountInput = document.getElementById('randomCount');
   const shuffleBtn = document.getElementById('shuffleBtn');
+  const algoSelect = document.getElementById('algoSelect');
+  const presetSelect = document.getElementById('presetSelect');
+  const copyLinkBtn = document.getElementById('copyLinkBtn');
 
   const speedSlider = document.getElementById('speedSlider');
   const speedValue = document.getElementById('speedValue');
@@ -434,62 +499,481 @@
   const statInitial = document.getElementById('statInitial');
   const statBadge = document.getElementById('statBadge');
 
+  const statCompareGA = document.getElementById('statCompareGA');
+  const statCompareTwoOpt = document.getElementById('statCompareTwoOpt');
+  const statCompareNN = document.getElementById('statCompareNN');
+  const compareCardGA = document.getElementById('compareCardGA');
+  const compareCardTwoOpt = document.getElementById('compareCardTwoOpt');
+  const compareCardNN = document.getElementById('compareCardNN');
+
   // =========================================================================
   // Global state
+  //
+  // CONTRACT: city coordinates are immutable pins. A city, once placed, never
+  // has its x/y written to again — cities only change wholesale (a brand new
+  // array) via an explicit user action (click-to-add, preset, Random,
+  // Reset). Every solver (GA / 2-opt / nearest-neighbor), including
+  // crossover, mutation, and local search, operates ONLY on plain arrays of
+  // integer indices into state.cities (permutations), never on arrays of
+  // {x,y} objects. state.cities and every city object inside it are
+  // Object.freeze()-d after every rebuild (see freezeCities()) specifically
+  // so that any accidental `city.x = ...` / `city.y = ...` write anywhere
+  // (main thread OR inside the worker) throws a TypeError under strict mode
+  // instead of silently corrupting the map.
   // =========================================================================
   const state = {
-    cities: [],            // {x,y} in CSS-pixel coords relative to canvas top-left
-    distMatrix: null,      // flattened Float64Array, n*n, precomputed pairwise distances
+    cities: [],            // {x,y} in CSS-pixel coords relative to canvas top-left; frozen, read-only
+    distMatrix: null,      // flattened Float64Array, n*n, precomputed pairwise distances (main thread copy, used for NN baseline)
     n: 0,
-    population: [],        // array of permutations (each a plain array of city indices)
+    algo: 'ga',             // 'ga' | '2opt' | 'nn' — which solver is currently active/animating
     popSize: parseInt(popSlider.value, 10),
     mutationRate: parseFloat(mutSlider.value) / 100,
     gensPerFrame: parseInt(speedSlider.value, 10),
     generation: 0,
-    bestTour: null,
+    bestTour: null,         // array of city indices — the active algorithm's current best permutation
     bestDistance: null,
     initialDistance: null,
     ghostTour: null,        // snapshot of the best initial (messy) tour, for visual contrast
     history: [],            // best-distance-per-generation, for the convergence sparkline
     genSinceImprovement: 0,
-    running: false
+    running: false,
+    results: {              // last-known best distance per algorithm, for the comparison row
+      ga: { distance: null },
+      twoopt: { distance: null },
+      nn: { distance: null, tour: null }
+    }
   };
 
-  const TOURNAMENT_K = 5;          // tournament selection pool size
-  const MAX_HISTORY_POINTS = 400;  // cap + decimate to keep chart & memory bounded
   const ACCENT = '#3fe6cf';
   const START_COLOR = '#ffb454';
   const CITY_COLOR = '#e8ecf6';
   const GHOST_COLOR = 'rgba(150,160,255,0.16)';
 
   // =========================================================================
-  // Small utilities
+  // Worker source: the GA, 2-opt, and nearest-neighbor solver logic,
+  // duplicated/adapted to run standalone inside a Web Worker built from an
+  // inline Blob URL (workers can't reach the DOM or this closure, so
+  // everything it needs — city coords, params, commands — travels over
+  // postMessage). It only ever permutes arrays of integer city indices; it
+  // never writes to a city's x/y.
   // =========================================================================
-  function randInt(min, max) { // inclusive both ends
-    return Math.floor(Math.random() * (max - min + 1)) + min;
+  const workerSrc = `
+'use strict';
+
+// Cities arrive as plain {x,y} objects (structured-cloned from the frozen
+// main-thread array — the clone itself is a fresh, unfrozen object, which is
+// fine: this worker treats it as read-only regardless). Tours are always
+// plain arrays of integer indices into this array. Nothing in this file ever
+// assigns to city.x or city.y.
+let cities = [];
+let distMatrix = null;
+let n = 0;
+
+let algo = 'ga';          // 'ga' | '2opt'
+let running = false;
+let popSize = 120;
+let mutationRate = 0.08;
+let batchSize = 5;
+let workerId = null;
+
+const TOURNAMENT_K = 5;
+const MAX_HISTORY_POINTS = 400;
+
+let ga = null;      // { population, generation, bestTour, bestDistance, initialDistance, ghostTour, history, genSinceImprovement }
+let twoOpt = null;  // { tour, distance, initialDistance, ghostTour, generation, history, genSinceImprovement }
+let loopScheduled = false;
+
+// ---------- small utilities ----------
+function randInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function distBetween(p, q) { return Math.hypot(p.x - q.x, p.y - q.y); }
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = randInt(0, i);
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+function randomTour(count) {
+  const t = [];
+  for (let i = 0; i < count; i++) t.push(i);
+  return shuffleArray(t);
+}
+
+function buildDistanceMatrix() {
+  const mat = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const dd = distBetween(cities[i], cities[j]);
+      mat[i * n + j] = dd;
+      mat[j * n + i] = dd;
+    }
+  }
+  distMatrix = mat;
+}
+function d(i, j) { return distMatrix[i * n + j]; }
+function tourDistance(tour) {
+  const len = tour.length;
+  if (len < 2) return 0;
+  let total = 0;
+  for (let k = 0; k < len; k++) total += d(tour[k], tour[(k + 1) % len]);
+  return total;
+}
+
+// Nearest-Neighbor construction from the designated start city (index 0),
+// used as the initial tour for the 2-opt demo.
+function nearestNeighborTour() {
+  const visited = new Array(n).fill(false);
+  const tour = [0];
+  visited[0] = true;
+  for (let step = 1; step < n; step++) {
+    const last = tour[tour.length - 1];
+    let best = -1, bestD = Infinity;
+    for (let k = 0; k < n; k++) {
+      if (visited[k]) continue;
+      const dd = d(last, k);
+      if (dd < bestD) { bestD = dd; best = k; }
+    }
+    tour.push(best);
+    visited[best] = true;
+  }
+  return tour;
+}
+
+// ---------- GA operators (mirrors the main-thread implementation) ----------
+function tournamentSelect(population, distances) {
+  let bestIdx = randInt(0, population.length - 1);
+  for (let i = 1; i < TOURNAMENT_K; i++) {
+    const idx = randInt(0, population.length - 1);
+    if (distances[idx] < distances[bestIdx]) bestIdx = idx;
+  }
+  return population[bestIdx];
+}
+
+// Order Crossover (OX): copy a random contiguous slice from parent A
+// verbatim, then fill the remaining slots (in order, wrapping) with genes
+// from parent B that aren't already used — guarantees a valid permutation.
+function orderCrossover(parentA, parentB) {
+  const len = parentA.length;
+  const child = new Array(len).fill(-1);
+  const used = new Set();
+  let start = randInt(0, len - 1);
+  let end = randInt(0, len - 1);
+  if (start > end) { const t = start; start = end; end = t; }
+  for (let i = start; i <= end; i++) { child[i] = parentA[i]; used.add(parentA[i]); }
+  let insertPos = (end + 1) % len;
+  for (let offset = 0; offset < len; offset++) {
+    const gene = parentB[(end + 1 + offset) % len];
+    if (!used.has(gene)) {
+      child[insertPos] = gene;
+      used.add(gene);
+      insertPos = (insertPos + 1) % len;
+    }
+  }
+  return child;
+}
+
+// Reverse tour[i..j] in place (inclusive) — the core 2-opt move: removes
+// edges (i-1,i) and (j,j+1), reconnects as (i-1,j) and (i,j+1).
+function reverseSegment(tour, i, j) {
+  while (i < j) { const t = tour[i]; tour[i] = tour[j]; tour[j] = t; i++; j--; }
+}
+
+function mutate(tour) {
+  const len = tour.length;
+  if (len < 2) return tour;
+  if (len >= 4 && Math.random() < 0.75) {
+    const i = randInt(0, len - 2);
+    const j = randInt(i + 1, len - 1);
+    reverseSegment(tour, i, j);
+  } else {
+    const i = randInt(0, len - 1), j = randInt(0, len - 1);
+    const t = tour[i]; tour[i] = tour[j]; tour[j] = t;
+  }
+  return tour;
+}
+
+// Randomized 2-opt local-search pass: tries 'attempts' random edge-swaps and
+// only keeps ones that shrink the tour, using an O(1) delta. Skips the
+// whole-tour-reversal edge case (i=0, j=n-1), which is a no-op anyway.
+function twoOptImprove(tour, currentDist, attempts) {
+  const len = tour.length;
+  if (len < 4) return currentDist;
+  let dist = currentDist;
+  for (let a = 0; a < attempts; a++) {
+    const i = randInt(0, len - 2);
+    const j = randInt(i + 1, len - 1);
+    if (i === 0 && j === len - 1) continue;
+    const pa = tour[(i - 1 + len) % len];
+    const pb = tour[i];
+    const pc = tour[j];
+    const pn = tour[(j + 1) % len];
+    const before = d(pa, pb) + d(pc, pn);
+    const after = d(pa, pc) + d(pb, pn);
+    const delta = after - before;
+    if (delta < -1e-9) {
+      reverseSegment(tour, i, j);
+      dist += delta;
+    }
+  }
+  return dist;
+}
+
+function pushHistory(historyArr, value) {
+  historyArr.push(value);
+  if (historyArr.length > MAX_HISTORY_POINTS) {
+    const decimated = [];
+    for (let i = 0; i < historyArr.length; i += 2) decimated.push(historyArr[i]);
+    historyArr.length = 0;
+    for (let i = 0; i < decimated.length; i++) historyArr.push(decimated[i]);
+  }
+}
+
+// ---------- GA lifecycle ----------
+function initGA() {
+  const pop = [];
+  for (let i = 0; i < popSize; i++) pop.push(randomTour(n));
+  const distances = pop.map(tourDistance);
+  let bestIdx = 0;
+  for (let i = 1; i < distances.length; i++) if (distances[i] < distances[bestIdx]) bestIdx = i;
+  ga = {
+    population: pop,
+    generation: 0,
+    bestTour: pop[bestIdx].slice(),
+    bestDistance: distances[bestIdx],
+    initialDistance: distances[bestIdx],
+    ghostTour: pop[bestIdx].slice(),
+    history: [distances[bestIdx]],
+    genSinceImprovement: 0
+  };
+}
+
+function stepGA() {
+  const distances = ga.population.map(tourDistance);
+  let eliteIdx = 0;
+  for (let i = 1; i < distances.length; i++) if (distances[i] < distances[eliteIdx]) eliteIdx = i;
+  let eliteTour = ga.population[eliteIdx].slice();
+  let eliteDist = distances[eliteIdx];
+
+  const attempts = Math.min(60, Math.max(10, n));
+  eliteDist = twoOptImprove(eliteTour, eliteDist, attempts);
+
+  const newPopulation = [eliteTour.slice()];
+  while (newPopulation.length < popSize) {
+    const parentA = tournamentSelect(ga.population, distances);
+    const parentB = tournamentSelect(ga.population, distances);
+    let child = orderCrossover(parentA, parentB);
+    if (Math.random() < mutationRate) child = mutate(child);
+    newPopulation.push(child);
+  }
+  ga.population = newPopulation;
+  ga.generation++;
+
+  if (ga.bestDistance === null || eliteDist < ga.bestDistance - 1e-9) ga.genSinceImprovement = 0;
+  else ga.genSinceImprovement++;
+  ga.bestDistance = eliteDist;
+  ga.bestTour = eliteTour;
+  pushHistory(ga.history, eliteDist);
+}
+
+// ---------- 2-opt lifecycle (pure greedy local search demo) ----------
+function initTwoOpt() {
+  const tour = nearestNeighborTour();
+  const dist = tourDistance(tour);
+  twoOpt = {
+    tour: tour,
+    distance: dist,
+    initialDistance: dist,
+    ghostTour: tour.slice(),
+    generation: 0,
+    history: [dist],
+    genSinceImprovement: 0
+  };
+}
+
+function stepTwoOpt() {
+  const attempts = Math.max(30, Math.min(400, n * 2));
+  const before = twoOpt.distance;
+  twoOpt.distance = twoOptImprove(twoOpt.tour, twoOpt.distance, attempts);
+  twoOpt.generation++;
+  if (twoOpt.distance < before - 1e-9) twoOpt.genSinceImprovement = 0;
+  else twoOpt.genSinceImprovement++;
+  pushHistory(twoOpt.history, twoOpt.distance);
+}
+
+// ---------- messaging ----------
+function currentEngine() { return algo === 'ga' ? ga : twoOpt; }
+
+function postProgress() {
+  const eng = currentEngine();
+  if (!eng) return;
+  postMessage({
+    type: 'progress',
+    workerId: workerId,
+    algo: algo,
+    generation: eng.generation,
+    distance: algo === 'ga' ? eng.bestDistance : eng.distance,
+    initialDistance: eng.initialDistance,
+    bestTourIndices: (algo === 'ga' ? eng.bestTour : eng.tour).slice(),
+    ghostTourIndices: eng.ghostTour ? eng.ghostTour.slice() : null,
+    history: eng.history.slice(),
+    genSinceImprovement: eng.genSinceImprovement
+  });
+}
+
+// Runs batches of generations per postMessage round-trip rather than
+// posting after every single generation, so the main thread never gets
+// flooded even at 500+ cities: each pass does at least batchSize
+// generations AND at least ~12ms of wall-clock work before posting once,
+// then yields via setTimeout(0) (workers don't get a reliable rAF).
+function loop() {
+  loopScheduled = false;
+  if (!running || n < 2) return;
+  const start = Date.now();
+  let done = 0;
+  while (done < batchSize || (Date.now() - start) < 12) {
+    if (algo === 'ga') stepGA(); else stepTwoOpt();
+    done++;
+    if (done > 100000) break; // safety valve
+  }
+  postProgress();
+  if (running) { loopScheduled = true; setTimeout(loop, 0); }
+}
+
+function ensureLoop() {
+  if (running && !loopScheduled && n >= 2) { loopScheduled = true; setTimeout(loop, 0); }
+}
+
+function reinitActiveAlgo() {
+  if (n < 2) { ga = null; twoOpt = null; return; }
+  if (algo === 'ga') initGA(); else initTwoOpt();
+  postProgress();
+}
+
+self.onmessage = function (e) {
+  const msg = e.data;
+  switch (msg.cmd) {
+    case 'init':
+      workerId = msg.workerId;
+      cities = msg.cities;
+      n = cities.length;
+      popSize = msg.popSize;
+      mutationRate = msg.mutationRate;
+      batchSize = msg.batchSize;
+      algo = msg.algo;
+      running = !!msg.running;
+      if (n >= 2) buildDistanceMatrix();
+      reinitActiveAlgo();
+      ensureLoop();
+      break;
+    case 'setAlgo':
+      algo = msg.algo;
+      reinitActiveAlgo();
+      ensureLoop();
+      break;
+    case 'reset':
+      reinitActiveAlgo();
+      ensureLoop();
+      break;
+    case 'play':
+      running = true;
+      ensureLoop();
+      break;
+    case 'pause':
+      running = false;
+      break;
+    case 'setParams':
+      mutationRate = msg.mutationRate;
+      batchSize = msg.batchSize;
+      if (algo === 'ga' && msg.popSize !== popSize) {
+        popSize = msg.popSize;
+        reinitActiveAlgo();
+      }
+      break;
+  }
+};
+`;
+
+  // =========================================================================
+  // Web Worker: all GA / 2-opt generation-stepping happens off the main
+  // thread. The main thread only renders (canvas draw using city coords it
+  // already holds + an index permutation received from the worker) and
+  // handles input. `workerId` guards against stale messages from a
+  // just-terminated worker instance; `workerAlgo` tracks which algorithm the
+  // live worker instance is currently running ('ga' or '2opt' — 'nn' never
+  // runs in the worker, it's one-shot and computed on the main thread).
+  // =========================================================================
+  let worker = null;
+  let workerAlgo = null;
+  let workerId = 0;
+
+  function terminateWorker() {
+    if (worker) { worker.terminate(); worker = null; }
+    workerAlgo = null;
   }
 
+  function spawnWorker() {
+    terminateWorker();
+    if (state.cities.length < 2) return;
+    workerId++;
+    const myWorkerId = workerId;
+    const blob = new Blob([workerSrc], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    worker = new Worker(url);
+    worker.onmessage = handleWorkerMessage;
+    workerAlgo = (state.algo === 'nn') ? 'ga' : state.algo;
+    worker.postMessage({
+      cmd: 'init',
+      workerId: myWorkerId,
+      cities: state.cities.map(function (c) { return { x: c.x, y: c.y }; }),
+      algo: workerAlgo,
+      popSize: state.popSize,
+      mutationRate: state.mutationRate,
+      batchSize: state.gensPerFrame,
+      running: state.running && state.algo !== 'nn'
+    });
+  }
+
+  function handleWorkerMessage(e) {
+    const msg = e.data;
+    if (msg.type !== 'progress') return;
+    if (msg.workerId !== workerId) return;   // message from a stale/terminated worker
+    if (msg.algo !== workerAlgo) return;     // message from before an algo switch settled
+
+    if (msg.algo === 'ga') state.results.ga.distance = msg.distance;
+    else if (msg.algo === '2opt') state.results.twoopt.distance = msg.distance;
+
+    if (state.algo === msg.algo) {
+      state.generation = msg.generation;
+      state.bestTour = msg.bestTourIndices;
+      state.bestDistance = msg.distance;
+      state.initialDistance = msg.initialDistance;
+      state.ghostTour = msg.ghostTourIndices;
+      state.genSinceImprovement = msg.genSinceImprovement;
+      state.history = msg.history;
+    }
+  }
+
+  function sendParamsToWorker() {
+    if (!worker) return;
+    worker.postMessage({
+      cmd: 'setParams',
+      popSize: state.popSize,
+      mutationRate: state.mutationRate,
+      batchSize: state.gensPerFrame
+    });
+  }
+
+  // =========================================================================
+  // Small utilities (main-thread copies; only used for the one-shot Nearest
+  // Neighbor baseline, which is cheap enough to run synchronously here)
+  // =========================================================================
   function distBetween(p, q) {
     return Math.hypot(p.x - q.x, p.y - q.y);
   }
 
-  function shuffleArray(arr) {
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = randInt(0, i);
-      const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
-    }
-    return arr;
-  }
-
-  function randomTour(n) {
-    const t = [];
-    for (let i = 0; i < n; i++) t.push(i);
-    return shuffleArray(t);
-  }
-
   // =========================================================================
-  // Distance matrix (precomputed once per city-set change, avoids repeated
-  // sqrt calls across the whole population every generation)
+  // Distance matrix (main-thread copy, used only to score the Nearest
+  // Neighbor baseline instantly whenever the city set changes)
   // =========================================================================
   function buildDistanceMatrix() {
     const n = state.cities.length;
@@ -519,132 +1003,67 @@
     return total;
   }
 
-  // =========================================================================
-  // GA operators
-  // =========================================================================
-
-  // Tournament selection: sample k random individuals, return the fittest
-  // (lowest tour distance) as a parent candidate.
-  function tournamentSelect(population, distances) {
-    let bestIdx = randInt(0, population.length - 1);
-    for (let i = 1; i < TOURNAMENT_K; i++) {
-      const idx = randInt(0, population.length - 1);
-      if (distances[idx] < distances[bestIdx]) bestIdx = idx;
-    }
-    return population[bestIdx];
-  }
-
-  // Order Crossover (OX):
-  //  1. Copy a random contiguous slice [start..end] from parent A verbatim.
-  //  2. Walk parent B starting right after `end` (wrapping around), and drop
-  //     each gene NOT already used into the next open slot of the child,
-  //     also wrapping. Because we only advance the insertion cursor when we
-  //     actually place a gene, the open slots visited are exactly the
-  //     positions outside [start..end], in order — guaranteeing every city
-  //     ends up in the child exactly once (a valid permutation).
-  function orderCrossover(parentA, parentB) {
-    const n = parentA.length;
-    const child = new Array(n).fill(-1);
-    const used = new Set();
-
-    let start = randInt(0, n - 1);
-    let end = randInt(0, n - 1);
-    if (start > end) { const t = start; start = end; end = t; }
-
-    for (let i = start; i <= end; i++) {
-      child[i] = parentA[i];
-      used.add(parentA[i]);
-    }
-
-    let insertPos = (end + 1) % n;
-    for (let offset = 0; offset < n; offset++) {
-      const gene = parentB[(end + 1 + offset) % n];
-      if (!used.has(gene)) {
-        child[insertPos] = gene;
-        used.add(gene);
-        insertPos = (insertPos + 1) % n;
+  // Nearest-Neighbor construction starting from the designated start city
+  // (index 0, the glowing/highlighted city). One-shot, computed instantly on
+  // the main thread — never "runs live" the way GA/2-opt do.
+  function nearestNeighborTourMain() {
+    const n = state.cities.length;
+    const visited = new Array(n).fill(false);
+    const tour = [0];
+    visited[0] = true;
+    for (let step = 1; step < n; step++) {
+      const last = tour[tour.length - 1];
+      let best = -1, bestD = Infinity;
+      for (let k = 0; k < n; k++) {
+        if (visited[k]) continue;
+        const dd = d(last, k);
+        if (dd < bestD) { bestD = dd; best = k; }
       }
-    }
-    return child;
-  }
-
-  // Reverse tour[i..j] in place (inclusive). This single move is the core
-  // 2-opt operator: it removes the two edges (i-1,i) and (j,j+1) and
-  // reconnects as (i-1,j) and (i,j+1), which is exactly what "uncrosses"
-  // two overlapping path segments on the map.
-  function reverseSegment(tour, i, j) {
-    while (i < j) {
-      const t = tour[i]; tour[i] = tour[j]; tour[j] = t;
-      i++; j--;
-    }
-  }
-
-  // Mutation: mostly 2-opt segment reversal (this is what visually untangles
-  // crossed edges), occasionally a plain swap for extra diversity.
-  function mutate(tour) {
-    const n = tour.length;
-    if (n < 2) return tour;
-    if (n >= 4 && Math.random() < 0.75) {
-      const i = randInt(0, n - 2);
-      const j = randInt(i + 1, n - 1);
-      reverseSegment(tour, i, j);
-    } else {
-      const i = randInt(0, n - 1);
-      const j = randInt(0, n - 1);
-      const t = tour[i]; tour[i] = tour[j]; tour[j] = t;
+      tour.push(best);
+      visited[best] = true;
     }
     return tour;
   }
 
-  // Light 2-opt local-search pass applied directly to the elite each
-  // generation. Tries a handful of random 2-opt moves and only keeps ones
-  // that shrink the tour, using an O(1) delta (no full O(n) recompute).
-  //
-  // Edge case: if the sampled segment spans the ENTIRE tour (i=0 and
-  // j=n-1), the "outside" neighbors collapse onto the segment's own
-  // endpoints, which would corrupt the delta math (self-distances are 0).
-  // Reversing the whole tour is a no-op for a closed loop anyway, so we
-  // just skip that combination.
-  function twoOptImprove(tour, currentDist, attempts) {
-    const n = tour.length;
-    if (n < 4) return currentDist;
-    let dist = currentDist;
-    for (let a = 0; a < attempts; a++) {
-      const i = randInt(0, n - 2);
-      const j = randInt(i + 1, n - 1);
-      if (i === 0 && j === n - 1) continue; // whole-tour reversal: no-op, skip
-
-      const pa = tour[(i - 1 + n) % n];
-      const pb = tour[i];
-      const pc = tour[j];
-      const pn = tour[(j + 1) % n];
-
-      const before = d(pa, pb) + d(pc, pn);
-      const after = d(pa, pc) + d(pb, pn);
-      const delta = after - before;
-
-      if (delta < -1e-9) {
-        reverseSegment(tour, i, j);
-        dist += delta;
-      }
+  function computeNNBaseline() {
+    if (state.cities.length < 2) {
+      state.results.nn.distance = null;
+      state.results.nn.tour = null;
+      return;
     }
-    return dist;
+    const tour = nearestNeighborTourMain();
+    state.results.nn.tour = tour;
+    state.results.nn.distance = tourDistance(tour);
+  }
+
+  // Makes the (already-computed) NN baseline the actively-displayed tour.
+  // NN is a one-shot baseline, not a live-improving algorithm, so there is
+  // no ghost/before tour and no generation counter for it.
+  function applyNNAsActive() {
+    const nn = state.results.nn;
+    state.bestTour = nn.tour ? nn.tour.slice() : null;
+    state.bestDistance = nn.distance;
+    state.initialDistance = nn.distance;
+    state.ghostTour = null;
+    state.generation = 0;
+    state.history = nn.distance != null ? [nn.distance] : [];
+    state.genSinceImprovement = 0;
   }
 
   // =========================================================================
-  // Population / evolution lifecycle
+  // City lifecycle: cities change ONLY through these entry points (canvas
+  // click, presets, Random, Reset). Every one of them ends by freezing the
+  // city objects + the containing array (see freezeCities) and then either
+  // terminating-and-recreating the worker (city SET changed) or, for
+  // Nearest-Neighbor, recomputing the instant baseline on the main thread.
   // =========================================================================
-  function initPopulation() {
-    const n = state.cities.length;
-    const pop = [];
-    for (let i = 0; i < state.popSize; i++) pop.push(randomTour(n));
-    state.population = pop;
+  function freezeCities() {
+    for (let i = 0; i < state.cities.length; i++) Object.freeze(state.cities[i]);
+    Object.freeze(state.cities);
   }
 
-  // Rebuilds the population from scratch and resets all run stats. Used
-  // whenever the city set changes (add/random/reset) AND for the explicit
-  // Shuffle/Restart action (which keeps the cities but starts fresh).
-  function resetEvolutionState() {
+  function handleCitiesChanged() {
+    freezeCities();
     state.generation = 0;
     state.history = [];
     state.genSinceImprovement = 0;
@@ -652,73 +1071,150 @@
     state.initialDistance = null;
     state.bestTour = null;
     state.ghostTour = null;
+    state.results.ga.distance = null;
+    state.results.twoopt.distance = null;
+    state.results.nn.distance = null;
+    state.results.nn.tour = null;
 
     if (state.cities.length >= 2) {
       buildDistanceMatrix();
-      initPopulation();
-      const distances = state.population.map(tourDistance);
-      let bestIdx = 0;
-      for (let i = 1; i < distances.length; i++) {
-        if (distances[i] < distances[bestIdx]) bestIdx = i;
-      }
-      state.bestTour = state.population[bestIdx].slice();
-      state.bestDistance = distances[bestIdx];
-      state.initialDistance = distances[bestIdx];
-      state.ghostTour = state.population[bestIdx].slice();
+      computeNNBaseline();
+      spawnWorker();
+      if (state.algo === 'nn') applyNNAsActive();
     } else {
       state.distMatrix = null;
       state.n = state.cities.length;
-      state.population = [];
+      terminateWorker();
     }
   }
 
-  function pushHistory(distValue) {
-    state.history.push(distValue);
-    if (state.history.length > MAX_HISTORY_POINTS) {
-      const decimated = [];
-      for (let i = 0; i < state.history.length; i += 2) decimated.push(state.history[i]);
-      state.history = decimated;
+  function applyCities(newCities) {
+    state.cities = newCities;
+    hideInstructions();
+    handleCitiesChanged();
+  }
+
+  // =========================================================================
+  // Presets — each replaces the current cities outright and restarts
+  // evolution with a fresh worker + fresh population (via handleCitiesChanged).
+  // =========================================================================
+  function presetCircle(count) {
+    const w = canvas.clientWidth || 600, h = canvas.clientHeight || 400;
+    const cx = w / 2, cy = h / 2;
+    const r = Math.max(40, Math.min(w, h) / 2 - 40);
+    const list = [];
+    for (let i = 0; i < count; i++) {
+      const theta = (i / count) * Math.PI * 2;
+      list.push({ x: cx + r * Math.cos(theta), y: cy + r * Math.sin(theta) });
+    }
+    return list;
+  }
+
+  function presetGrid(count) {
+    const w = canvas.clientWidth || 600, h = canvas.clientHeight || 400;
+    const margin = 40;
+    const usableW = Math.max(1, w - margin * 2);
+    const usableH = Math.max(1, h - margin * 2);
+    const cols = Math.max(1, Math.round(Math.sqrt(count * usableW / usableH)));
+    const rows = Math.max(1, Math.ceil(count / cols));
+    const list = [];
+    for (let i = 0; i < count; i++) {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = margin + (cols === 1 ? usableW / 2 : (col / (cols - 1)) * usableW);
+      const y = margin + (rows === 1 ? usableH / 2 : (row / (rows - 1)) * usableH);
+      list.push({ x: x, y: y });
+    }
+    return list;
+  }
+
+  function presetClusters(count) {
+    const w = canvas.clientWidth || 600, h = canvas.clientHeight || 400;
+    const margin = 50;
+    const clusterCount = Math.max(2, Math.min(8, Math.round(count / 12)));
+    const centers = [];
+    for (let i = 0; i < clusterCount; i++) {
+      centers.push({
+        x: margin + Math.random() * Math.max(1, w - margin * 2),
+        y: margin + Math.random() * Math.max(1, h - margin * 2)
+      });
+    }
+    const spread = Math.min(w, h) * 0.09;
+    const list = [];
+    for (let i = 0; i < count; i++) {
+      const c = centers[i % clusterCount];
+      // Poor-man's gaussian: sum of uniforms, roughly bell-shaped around 0.
+      const gx = (Math.random() + Math.random() + Math.random() - 1.5) * spread;
+      const gy = (Math.random() + Math.random() + Math.random() - 1.5) * spread;
+      let x = c.x + gx, y = c.y + gy;
+      x = Math.max(margin, Math.min(w - margin, x));
+      y = Math.max(margin, Math.min(h - margin, y));
+      list.push({ x: x, y: y });
+    }
+    return list;
+  }
+
+  function presetSpiral(count) {
+    const w = canvas.clientWidth || 600, h = canvas.clientHeight || 400;
+    const cx = w / 2, cy = h / 2;
+    const maxR = Math.max(30, Math.min(w, h) / 2 - 30);
+    const turns = 3;
+    const list = [];
+    for (let i = 0; i < count; i++) {
+      const t = i / Math.max(1, count - 1);
+      const r = t * maxR;
+      const theta = t * turns * Math.PI * 2;
+      list.push({ x: cx + r * Math.cos(theta), y: cy + r * Math.sin(theta) });
+    }
+    return list;
+  }
+
+  // =========================================================================
+  // Share via URL: pack rounded integer city coords into a Uint16Array,
+  // base64-encode the raw bytes, store as ?c=. Compact (2 bytes per axis per
+  // city) rather than JSON.
+  // =========================================================================
+  function encodeCitiesToParam(cities) {
+    const n = cities.length;
+    const arr = new Uint16Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      arr[i * 2] = Math.max(0, Math.min(65535, Math.round(cities[i].x)));
+      arr[i * 2 + 1] = Math.max(0, Math.min(65535, Math.round(cities[i].y)));
+    }
+    const bytes = new Uint8Array(arr.buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  function decodeCitiesFromParam(param) {
+    try {
+      const binary = atob(param);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      if (bytes.length < 4 || bytes.length % 4 !== 0) return null;
+      const arr = new Uint16Array(bytes.buffer);
+      const list = [];
+      for (let i = 0; i + 1 < arr.length; i += 2) list.push({ x: arr[i], y: arr[i + 1] });
+      return list.length >= 1 ? list : null;
+    } catch (err) {
+      return null;
     }
   }
 
-  // Advance the GA by exactly one generation.
-  function evolveOneGeneration() {
-    if (state.cities.length < 2 || state.population.length === 0) return;
+  function citiesFromUrl() {
+    const params = new URLSearchParams(location.search);
+    const c = params.get('c');
+    if (!c) return null;
+    return decodeCitiesFromParam(c);
+  }
 
-    const distances = state.population.map(tourDistance);
-    let eliteIdx = 0;
-    for (let i = 1; i < distances.length; i++) {
-      if (distances[i] < distances[eliteIdx]) eliteIdx = i;
+  function fallbackPrompt(url) {
+    try {
+      window.prompt('Copy this link:', url);
+    } catch (err) {
+      window.alert(url);
     }
-
-    let eliteTour = state.population[eliteIdx].slice();
-    let eliteDist = distances[eliteIdx];
-
-    // Extra local-search polish on the elite (see twoOptImprove docs above).
-    const attempts = Math.min(60, Math.max(10, state.n));
-    eliteDist = twoOptImprove(eliteTour, eliteDist, attempts);
-
-    // Elitism: the (possibly 2-opt-improved) elite goes straight into the
-    // next generation untouched by crossover/mutation.
-    const newPopulation = [eliteTour.slice()];
-    while (newPopulation.length < state.popSize) {
-      const parentA = tournamentSelect(state.population, distances);
-      const parentB = tournamentSelect(state.population, distances);
-      let child = orderCrossover(parentA, parentB);
-      if (Math.random() < state.mutationRate) child = mutate(child);
-      newPopulation.push(child);
-    }
-    state.population = newPopulation;
-    state.generation++;
-
-    if (state.bestDistance === null || eliteDist < state.bestDistance - 1e-9) {
-      state.genSinceImprovement = 0;
-    } else {
-      state.genSinceImprovement++;
-    }
-    state.bestDistance = eliteDist;
-    state.bestTour = eliteTour;
-    pushHistory(eliteDist);
   }
 
   // =========================================================================
@@ -886,7 +1382,7 @@
   // Stats UI
   // =========================================================================
   function updateStatsUI() {
-    statGeneration.textContent = state.generation;
+    statGeneration.textContent = state.algo === 'nn' ? '—' : state.generation;
     statCities.textContent = state.cities.length;
     statBestDist.textContent = state.bestDistance != null ? state.bestDistance.toFixed(1) : '—';
     statInitial.textContent = state.initialDistance != null ? state.initialDistance.toFixed(1) : '—';
@@ -901,6 +1397,8 @@
     let badgeText, badgeClass;
     if (state.cities.length < 2) {
       badgeText = 'Idle'; badgeClass = 'badge-idle';
+    } else if (state.algo === 'nn') {
+      badgeText = 'Baseline (one-shot)'; badgeClass = 'badge-idle';
     } else if (state.genSinceImprovement < 15) {
       badgeText = 'Improving'; badgeClass = 'badge-improving';
     } else {
@@ -908,6 +1406,14 @@
     }
     statBadge.textContent = badgeText;
     statBadge.className = 'badge ' + badgeClass;
+
+    statCompareGA.textContent = state.results.ga.distance != null ? state.results.ga.distance.toFixed(1) : '—';
+    statCompareTwoOpt.textContent = state.results.twoopt.distance != null ? state.results.twoopt.distance.toFixed(1) : '—';
+    statCompareNN.textContent = state.results.nn.distance != null ? state.results.nn.distance.toFixed(1) : '—';
+
+    compareCardGA.classList.toggle('active', state.algo === 'ga');
+    compareCardTwoOpt.classList.toggle('active', state.algo === '2opt');
+    compareCardNN.classList.toggle('active', state.algo === 'nn');
   }
 
   // =========================================================================
@@ -924,22 +1430,22 @@
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    state.cities.push({ x: x, y: y });
-    hideInstructions();
-    resetEvolutionState();
+    applyCities(state.cities.slice().concat([{ x: x, y: y }]));
   });
 
   playBtn.addEventListener('click', function () {
+    if (state.algo === 'nn') return; // NN is a one-shot baseline, nothing to play
     state.running = !state.running;
     updatePlayButton();
     hideInstructions();
+    if (worker) worker.postMessage({ cmd: state.running ? 'play' : 'pause' });
   });
 
   resetBtn.addEventListener('click', function () {
     state.cities = [];
     state.running = false;
     updatePlayButton();
-    resetEvolutionState();
+    handleCitiesChanged();
     showInstructions();
   });
 
@@ -954,52 +1460,117 @@
     const usableW = Math.max(1, w - margin * 2);
     const usableH = Math.max(1, h - margin * 2);
 
+    const newCities = state.cities.slice();
     for (let i = 0; i < count; i++) {
       let x, y, tries = 0, ok = false;
       while (!ok && tries < 5) {
         x = margin + Math.random() * usableW;
         y = margin + Math.random() * usableH;
         ok = true;
-        for (let k = 0; k < state.cities.length; k++) {
-          const c = state.cities[k];
+        for (let k = 0; k < newCities.length; k++) {
+          const c = newCities[k];
           if (Math.abs(c.x - x) < 4 && Math.abs(c.y - y) < 4) { ok = false; break; }
         }
         tries++;
       }
-      state.cities.push({ x: x, y: y });
+      newCities.push({ x: x, y: y });
     }
-    hideInstructions();
-    resetEvolutionState();
+    applyCities(newCities);
+  });
+
+  presetSelect.addEventListener('change', function () {
+    const kind = presetSelect.value;
+    if (kind === 'custom') return;
+
+    let count = parseInt(randomCountInput.value, 10);
+    if (!Number.isFinite(count) || count < 3) count = 40;
+    count = Math.min(count, 2000);
+
+    let list = null;
+    if (kind === 'circle') list = presetCircle(count);
+    else if (kind === 'grid') list = presetGrid(count);
+    else if (kind === 'clusters') list = presetClusters(count);
+    else if (kind === 'spiral') list = presetSpiral(count);
+
+    if (list) applyCities(list);
+    presetSelect.value = 'custom'; // reset so picking the same preset again still fires 'change'
   });
 
   shuffleBtn.addEventListener('click', function () {
-    resetEvolutionState();
+    if (state.cities.length < 2) return;
+    if (state.algo === 'nn') {
+      computeNNBaseline();
+      applyNNAsActive();
+      return;
+    }
+    if (worker) worker.postMessage({ cmd: 'reset' });
+  });
+
+  algoSelect.addEventListener('change', function () {
+    state.algo = algoSelect.value;
+    if (state.algo === 'nn') {
+      if (worker) worker.postMessage({ cmd: 'pause' });
+      playBtn.disabled = true;
+      computeNNBaseline();
+      applyNNAsActive();
+    } else {
+      playBtn.disabled = false;
+      if (!worker) {
+        spawnWorker();
+      } else if (workerAlgo !== state.algo) {
+        workerAlgo = state.algo;
+        worker.postMessage({ cmd: 'setAlgo', algo: state.algo });
+        if (state.running) worker.postMessage({ cmd: 'play' });
+      } else {
+        worker.postMessage({ cmd: state.running ? 'play' : 'pause' });
+      }
+    }
+  });
+
+  copyLinkBtn.addEventListener('click', function () {
+    const payload = encodeCitiesToParam(state.cities);
+    const url = location.origin + location.pathname + '?c=' + encodeURIComponent(payload);
+    const originalLabel = copyLinkBtn.textContent;
+    function showCopied() {
+      copyLinkBtn.textContent = 'Copied!';
+      setTimeout(function () { copyLinkBtn.textContent = originalLabel; }, 1600);
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(showCopied, function () { fallbackPrompt(url); });
+      } else {
+        fallbackPrompt(url);
+      }
+    } catch (err) {
+      fallbackPrompt(url);
+    }
   });
 
   speedSlider.addEventListener('input', function () {
     state.gensPerFrame = parseInt(speedSlider.value, 10);
     speedValue.textContent = speedSlider.value;
+    sendParamsToWorker();
   });
 
   popSlider.addEventListener('input', function () {
     state.popSize = parseInt(popSlider.value, 10);
     popValue.textContent = popSlider.value;
-    resetEvolutionState();
+    sendParamsToWorker();
   });
 
   mutSlider.addEventListener('input', function () {
     state.mutationRate = parseFloat(mutSlider.value) / 100;
     mutValue.textContent = mutSlider.value + '%';
+    sendParamsToWorker();
   });
 
   // =========================================================================
-  // Main loop
+  // Main loop — rendering only. Generations are stepped inside the worker;
+  // this rAF loop just draws whatever the latest received worker message (or
+  // the instant NN baseline) put into `state`, and refreshes the stats UI.
   // =========================================================================
   function animate() {
     requestAnimationFrame(animate);
-    if (state.running && state.cities.length >= 2) {
-      for (let i = 0; i < state.gensPerFrame; i++) evolveOneGeneration();
-    }
     render();
     renderChart();
     updateStatsUI();
@@ -1009,7 +1580,14 @@
   // Boot
   // =========================================================================
   resizeAll();
-  resetEvolutionState();
+  const urlCities = citiesFromUrl();
+  if (urlCities && urlCities.length >= 1) {
+    state.cities = urlCities;
+    handleCitiesChanged();
+    hideInstructions();
+  } else {
+    handleCitiesChanged();
+  }
   updatePlayButton();
   updateStatsUI();
   requestAnimationFrame(animate);
