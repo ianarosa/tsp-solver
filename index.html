@@ -1931,10 +1931,11 @@ self.onmessage = function (e) {
       worldW: cols * cellSize, worldH: rows * cellSize,
       elevation: elevation, moisture: moisture, cellType: cellType, riverMask: riverMask
     };
-    Object.freeze(terrain.elevation);
-    Object.freeze(terrain.moisture);
-    Object.freeze(terrain.cellType);
-    Object.freeze(terrain.riverMask);
+    // NOTE: do NOT Object.freeze() the typed arrays — Object.freeze() on a
+    // non-empty TypedArray throws "Cannot freeze array buffer views with
+    // elements" (its integer-indexed elements can't be made non-configurable).
+    // Freezing the container is enough to lock the references; the solver only
+    // ever reads these arrays, never writes them (the immutability contract).
     Object.freeze(terrain);
     return terrain;
   }
