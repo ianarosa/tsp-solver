@@ -444,8 +444,9 @@
         <h2>Parameters</h2>
 
         <label class="field">
-          <div class="field-head"><span>Speed (generations / frame)</span><span class="val" id="speedValue">5</span></div>
-          <input type="range" id="speedSlider" min="1" max="50" step="1" value="5">
+          <div class="field-head"><span>Speed (generations / sec)</span><span class="val" id="speedValue">11 / s</span></div>
+          <input type="range" id="speedSlider" min="1" max="21" step="1" value="10">
+          <div class="hint">Low = step slowly so you can watch crossings vanish; top = MAX (unlimited full speed).</div>
         </label>
 
         <label class="field">
@@ -629,6 +630,24 @@
   // precomputed cost matrix built FROM terrain — it never mutates terrain or
   // city coordinates, in the worker or here.
   // =========================================================================
+  // Speed slider -> target generations-per-second. The slider is a 1..21
+  // integer: positions 1..20 map (roughly geometrically) onto ~1..~125
+  // gens/sec so the low end is genuinely step-through-able (you can watch
+  // individual crossings disappear), and position 21 is MAX (Infinity =
+  // unlimited, the original full-CPU behavior). Defined before `state` so the
+  // initial state can seed itself from the slider's default value.
+  // =========================================================================
+  const SPEED_SLIDER_MAX = 21;
+  function sliderToRate(v) {
+    if (!Number.isFinite(v) || v >= SPEED_SLIDER_MAX) return Infinity; // MAX / unlimited
+    if (v < 1) v = 1;
+    return Math.max(1, Math.round(Math.pow(1.28, v) * 0.9)); // v=1 -> ~1/s, v=10 -> ~11/s, v=20 -> ~125/s
+  }
+  function rateLabel(rate) {
+    return isFinite(rate) ? (rate + ' / s') : 'MAX';
+  }
+
+  // =========================================================================
   const state = {
     cities: [],            // {x,y} in CSS-pixel coords relative to canvas top-left; frozen, read-only
     distMatrix: null,      // flattened Float64Array, n*n, precomputed pairwise EUCLIDEAN distances (main thread copy; only used for the instant NN baseline on the Flat map)
@@ -636,7 +655,7 @@
     algo: 'ga',             // 'ga' | '2opt' | 'nn' — which solver is currently active/animating
     popSize: parseInt(popSlider.value, 10),
     mutationRate: parseFloat(mutSlider.value) / 100,
-    gensPerFrame: parseInt(speedSlider.value, 10),
+    targetRate: sliderToRate(parseInt(speedSlider.value, 10)), // gens/second cap sent to the worker; Infinity = MAX / unlimited
     generation: 0,
     bestTour: null,         // array of city indices — the active algorithm's current best permutation
     bestDistance: null,
@@ -699,7 +718,8 @@ let algo = 'ga';          // 'ga' | '2opt'
 let running = false;
 let popSize = 120;
 let mutationRate = 0.08;
-let batchSize = 5;
+let targetRate = Infinity; // generations/second cap (paces the loop); Infinity = MAX / unlimited
+let loopTimer = null;      // id of the pending setTimeout(loop, ...) so slider changes can reschedule immediately
 let workerId = null;
 let progressTick = 0;
 
@@ -1234,7 +1254,10 @@ function postProgress() {
   let pathData; // undefined = "not recomputed this tick, main thread keeps its previous copy"
   if (!terrain || !costMatrix) {
     pathData = null;
-  } else if (progressTick % 4 === 0 || eng.generation <= 1) {
+  } else if (isFinite(targetRate) || progressTick % 4 === 0 || eng.generation <= 1) {
+    // In paced (watchable) mode there's ample time-budget between ticks, so
+    // rebuild the bent routes every tick to keep the drawn tour in lockstep
+    // with each improvement. Only throttle to every 4th tick at MAX speed.
     pathData = buildTourPathSegments(tour);
   }
   postMessage({
@@ -1253,27 +1276,60 @@ function postProgress() {
   });
 }
 
-// Runs batches of generations per postMessage round-trip rather than
-// posting after every single generation, so the main thread never gets
-// flooded even at 500+ cities: each pass does at least batchSize
-// generations AND at least ~12ms of wall-clock work before posting once,
-// then yields via setTimeout(0) (workers don't get a reliable rAF).
+function stepOnce() { if (algo === 'ga') stepGA(); else stepTwoOpt(); }
+
+function scheduleNext(delay) {
+  if (running) { loopScheduled = true; loopTimer = setTimeout(loop, delay); }
+}
+
+// The core stepping loop, now RATE-LIMITED by targetRate (gens/sec):
+//   - MAX (targetRate === Infinity): the original full-CPU behavior — grind a
+//     chunk of generations (>= ~10ms of work) then yield via setTimeout(0),
+//     so people who just want the final answer still get it fast.
+//   - Paced (finite targetRate): run just a few generations, then sleep long
+//     enough that the effective rate matches the target. A ~16ms delay floor
+//     keeps the worker from busy-spinning at high rates; at the low end it's
+//     one generation per long sleep, so the tour visibly untangles leg by
+//     leg. Pause (running=false) makes the next fired timer return
+//     immediately — no busy spin.
 function loop() {
   loopScheduled = false;
+  loopTimer = null;
   if (!running || n < 2) return;
-  const start = Date.now();
-  let done = 0;
-  while (done < batchSize || (Date.now() - start) < 12) {
-    if (algo === 'ga') stepGA(); else stepTwoOpt();
-    done++;
-    if (done > 100000) break; // safety valve
+
+  if (!isFinite(targetRate)) {
+    const start = Date.now();
+    let done = 0;
+    while (done < 20 || (Date.now() - start) < 10) {
+      stepOnce();
+      done++;
+      if (done > 100000) break; // safety valve
+    }
+    postProgress();
+    scheduleNext(0);
+    return;
   }
+
+  const FRAME = 16; // ms — delay floor, ~one animation frame
+  const gensThisTick = Math.max(1, Math.round(targetRate * FRAME / 1000));
+  let delay = Math.round(gensThisTick / targetRate * 1000);
+  if (delay < 1) delay = 1;
+  for (let i = 0; i < gensThisTick; i++) stepOnce();
   postProgress();
-  if (running) { loopScheduled = true; setTimeout(loop, 0); }
+  scheduleNext(delay);
 }
 
 function ensureLoop() {
-  if (running && !loopScheduled && n >= 2) { loopScheduled = true; setTimeout(loop, 0); }
+  if (running && !loopScheduled && n >= 2) { loopScheduled = true; loopTimer = setTimeout(loop, 0); }
+}
+
+// Force the paced loop to pick up a new targetRate immediately (rather than
+// waiting out an already-scheduled — possibly up-to-1s — sleep), so dragging
+// the Speed slider while running feels live.
+function restartPacing() {
+  if (loopTimer !== null) { clearTimeout(loopTimer); loopTimer = null; }
+  loopScheduled = false;
+  ensureLoop();
 }
 
 function reinitActiveAlgo() {
@@ -1291,7 +1347,7 @@ self.onmessage = function (e) {
       n = cities.length;
       popSize = msg.popSize;
       mutationRate = msg.mutationRate;
-      batchSize = msg.batchSize;
+      targetRate = (msg.targetRate === undefined ? Infinity : msg.targetRate);
       algo = msg.algo;
       running = !!msg.running;
       terrain = msg.terrain || null;
@@ -1318,14 +1374,19 @@ self.onmessage = function (e) {
     case 'pause':
       running = false;
       break;
-    case 'setParams':
+    case 'setParams': {
       mutationRate = msg.mutationRate;
-      batchSize = msg.batchSize;
+      const newRate = (msg.targetRate === undefined ? Infinity : msg.targetRate);
+      const rateChanged = newRate !== targetRate;
+      targetRate = newRate;
       if (algo === 'ga' && msg.popSize !== popSize) {
         popSize = msg.popSize;
         reinitActiveAlgo();
       }
+      // Apply a speed change live, mid-run, without waiting out the current sleep.
+      if (rateChanged && running) restartPacing();
       break;
+    }
     case 'setTerrain':
       terrain = msg.terrain || null;
       terrainVersion++;
@@ -1399,7 +1460,7 @@ self.onmessage = function (e) {
       algo: workerAlgo,
       popSize: state.popSize,
       mutationRate: state.mutationRate,
-      batchSize: state.gensPerFrame,
+      targetRate: state.targetRate,
       running: state.running && state.algo !== 'nn',
       terrain: serializeTerrainForWorker(state.terrain),
       mode: state.transportMode
@@ -1449,7 +1510,7 @@ self.onmessage = function (e) {
       cmd: 'setParams',
       popSize: state.popSize,
       mutationRate: state.mutationRate,
-      batchSize: state.gensPerFrame
+      targetRate: state.targetRate
     });
   }
 
@@ -2435,9 +2496,9 @@ self.onmessage = function (e) {
   });
 
   speedSlider.addEventListener('input', function () {
-    state.gensPerFrame = parseInt(speedSlider.value, 10);
-    speedValue.textContent = speedSlider.value;
-    sendParamsToWorker();
+    state.targetRate = sliderToRate(parseInt(speedSlider.value, 10));
+    speedValue.textContent = rateLabel(state.targetRate);
+    sendParamsToWorker(); // live: worker reschedules its pacing immediately (see restartPacing)
   });
 
   popSlider.addEventListener('input', function () {
@@ -2491,6 +2552,7 @@ self.onmessage = function (e) {
     handleCitiesChanged();
   }
   updatePlayButton();
+  speedValue.textContent = rateLabel(state.targetRate);
   updateStatsUI();
   requestAnimationFrame(animate);
 
