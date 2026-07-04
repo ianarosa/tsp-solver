@@ -683,6 +683,7 @@
     transportMode: 'best',  // 'best' | 'highway' | 'train' | 'boat' | 'plane'
     pathSegments: null,     // array of per-leg point arrays for the CURRENT best tour, as reported by the worker (terrain-aware routing only)
     legModes: null,         // parallel array of winning-mode strings per leg (only meaningful in 'best' mode)
+    connectors: null,       // parallel to pathSegments: per boat leg, { a, b } routed over-land connector polylines ({mode,pts}) or null for non-boat legs
     ports: null             // per-city { x, y, cell, dock } port (nearest water cell) or null if landlocked; main-thread render-only copy, recomputed when cities/terrain change. NOT stored on the frozen city objects (immutability).
   };
 
@@ -720,7 +721,10 @@ let terrainVersion = 0;   // bumped on every terrain change so per-mode Dijkstra
 let mode = 'best';        // 'best' | 'highway' | 'train' | 'boat' | 'plane'
 let cityCellIdxArr = null; // Int32Array n — which terrain grid cell each city sits in
 let cityPortCellArr = null; // Int32Array n — nearest reachable WATER cell per city (boat embark/dock point), -1 if landlocked
-let cityPortDockArr = null; // Float64Array n — straight over-land distance city -> its port cell center (dock surcharge)
+let cityPortDockArr = null; // Float64Array n — straight over-land distance city -> its port cell center (straight-line dock fallback)
+let cityLandingCellArr = null;   // Int32Array n — LAND cell adjacent to the port on the city's side (overland connector endpoint), -1 if landlocked
+let cityConnectorModeArr = null; // Uint8Array n — MODE_IDS.highway or .train, chosen by connector length
+let cityConnectorCostArr = null; // Float64Array n — ACTUAL routed ground-cost city -> landing (Infinity if unreachable/landlocked)
 let modeCache = {};       // { [groundMode]: { terrainVersion, cellCost: Float64Array, perCity: [{dist,prev}, ...] } }
 
 let algo = 'ga';          // 'ga' | '2opt'
@@ -761,6 +765,13 @@ const RIVER_BOAT_COST = 1.2;                        // boats can also sail river
 const PLANE_AIR_FACTOR = 0.95;
 const PLANE_SURCHARGE = 220; // fixed takeoff/landing overhead — planes only pay off on long or terrain-blocked hauls
 const UNREACHABLE_PENALTY = 1e6; // large-but-finite stand-in for "no path" so the GA can still rank tours
+
+// A boat leg's over-land connector (city -> its port's landing cell) is a REAL
+// routed ground leg, priced and drawn with an actual mode. It uses HIGHWAY for
+// a short hop, TRAIN for a long haul; the cutoff is this fraction of the map's
+// diagonal (short = road, long = rail). Tunable — small enough that a
+// meaningfully inland city rails to the coast rather than driving the whole way.
+const CONNECTOR_TRAIN_FRACTION = 0.09;
 
 // City-count performance ceilings for terrain-aware costing. Deliberate,
 // documented caps rather than bugs:
@@ -887,6 +898,62 @@ function computePorts() {
     const p = computePortForCity(i);
     cityPortCellArr[i] = p.cell;
     cityPortDockArr[i] = p.dock;
+  }
+}
+
+// The LANDING for city i is the land cell adjacent to its port water cell, on
+// the city's side (the last land before the water). Chosen as the port's land
+// neighbour nearest the city center; if the port has no land neighbour (rare —
+// nearest water fully surrounded by water), the city's own cell is used so the
+// connector degenerates to ~zero. Deterministic (fixed 8-neighbour order).
+function landingCellFor(i) {
+  const port = cityPortCellArr[i];
+  if (port < 0) return -1;
+  const cols = terrain.cols, rows = terrain.rows, cellSize = terrain.cellSize;
+  const pcol = port % cols, prow = (port / cols) | 0;
+  const cx = cities[i].x, cy = cities[i].y;
+  let bestIdx = -1, bestD = Infinity;
+  for (let k = 0; k < 8; k++) {
+    const nc = pcol + NEI_DX[k], nr = prow + NEI_DY[k];
+    if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+    const nIdx = nr * cols + nc;
+    if (isWaterCell(nIdx)) continue; // landing must be land
+    const wx = (nc + 0.5) * cellSize, wy = (nr + 0.5) * cellSize;
+    const dd = Math.hypot(wx - cx, wy - cy);
+    if (dd < bestD) { bestD = dd; bestIdx = nIdx; }
+  }
+  if (bestIdx === -1) bestIdx = cityCellIdxArr[i];
+  return bestIdx;
+}
+
+// For each city with a port, compute the over-land CONNECTOR to its landing
+// cell: the mode (highway/train, by distance), the routed ground cost, and the
+// landing cell. Requires per-city ground Dijkstra (highway + train), so it's
+// only run for n <= TERRAIN_DIJKSTRA_CAP; larger counts keep the straight-line
+// dock fallback in costBetweenGround's boatLineMarchCost path.
+function computeConnectors() {
+  cityLandingCellArr = new Int32Array(n).fill(-1);
+  cityConnectorModeArr = new Uint8Array(n);
+  cityConnectorCostArr = new Float64Array(n).fill(Infinity);
+  if (!terrain || n > TERRAIN_DIJKSTRA_CAP) return;
+  ensureModeReady('highway');
+  ensureModeReady('train');
+  const diag = Math.hypot(terrain.cols * terrain.cellSize, terrain.rows * terrain.cellSize);
+  const threshold = CONNECTOR_TRAIN_FRACTION * diag;
+  const cols = terrain.cols, cellSize = terrain.cellSize;
+  for (let i = 0; i < n; i++) {
+    if (cityPortCellArr[i] < 0) continue; // landlocked — no connector, boat stays Infinity
+    const landing = landingCellFor(i);
+    cityLandingCellArr[i] = landing;
+    const port = cityPortCellArr[i];
+    const pcx = ((port % cols) + 0.5) * cellSize, pcy = (((port / cols) | 0) + 0.5) * cellSize;
+    const connDist = Math.hypot(pcx - cities[i].x, pcy - cities[i].y);
+    const gm = connDist <= threshold ? 'highway' : 'train';
+    cityConnectorModeArr[i] = MODE_IDS[gm];
+    const cache = modeCache[gm];
+    let cost = (cache && cache.perCity[i]) ? cache.perCity[i].dist[landing] : Infinity;
+    if (!isFinite(cost)) cost = cityPortDockArr[i]; // fallback: straight-line dock surcharge
+    cityConnectorCostArr[i] = cost;
   }
 }
 
@@ -1043,11 +1110,12 @@ function boatLineMarchCost(cellCost, i, j) {
 function costBetweenGround(m, i, j) {
   const cache = modeCache[m];
   if (m === 'boat') {
-    // Boat leg A->B = dock(A->portA) + water(portA->portB) + dock(portB->B).
-    // The water segment comes from the port-cell Dijkstra (all-water); if
-    // either city is landlocked, or the two ports sit on separate water bodies
-    // with no all-water route between them, the leg is unreachable — never a
-    // route across land.
+    // Boat leg A->B = connector(A->landingA) + water(portA->portB) +
+    // connector(landingB->B), where connector is the ACTUAL routed ground cost
+    // (highway/train) over land — not a straight line. The water segment comes
+    // from the port-cell Dijkstra (all-water). Unreachable (Infinity) if either
+    // city is landlocked, or the two ports sit on separate water bodies with no
+    // all-water route between them — never a route across land.
     const pi = cityPortCellArr[i], pj = cityPortCellArr[j];
     if (pi < 0 || pj < 0) return UNREACHABLE_PENALTY;
     if (n <= TERRAIN_DIJKSTRA_CAP) {
@@ -1055,7 +1123,9 @@ function costBetweenGround(m, i, j) {
       if (!src) return UNREACHABLE_PENALTY;
       const water = src.dist[pj];
       if (!isFinite(water)) return UNREACHABLE_PENALTY;
-      return cityPortDockArr[i] + water + cityPortDockArr[j];
+      const connA = cityConnectorCostArr[i], connB = cityConnectorCostArr[j];
+      if (!isFinite(connA) || !isFinite(connB)) return UNREACHABLE_PENALTY;
+      return connA + water + connB;
     }
     return boatLineMarchCost(cache.cellCost, i, j);
   }
@@ -1075,10 +1145,11 @@ function recomputeCosts() {
   if (n > TERRAIN_LINEAPPROX_CAP) return; // see TERRAIN_LINEAPPROX_CAP comment above — falls back to Euclidean
 
   cityCellIdxArr = cityToCellIdx();
-  // Ports are only needed when boats can be used (Boat mode, or Best which
-  // considers boat per leg). computePorts is a per-city ring search, so skip
-  // it for the pure-ground/plane modes that never read it.
-  if (mode === 'best' || mode === 'boat') computePorts();
+  // Ports + over-land connectors are only needed when boats can be used (Boat
+  // mode, or Best which considers boat per leg). Both are per-city searches, so
+  // skip them for the pure-ground/plane modes that never read them.
+  // computeConnectors ensures highway+train per-city Dijkstra is ready.
+  if (mode === 'best' || mode === 'boat') { computePorts(); computeConnectors(); }
 
   if (mode === 'plane') {
     const mat = new Float64Array(n * n);
@@ -1134,33 +1205,6 @@ function reconstructPath(m, i, j) {
     return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
   }
 
-  // Boat legs are drawn as: dock(city_i -> portA) + the all-water route
-  // (portA -> portB, walked back down the port-cell Dijkstra prev[] chain) +
-  // dock(portB -> city_j). The water polyline is guaranteed to touch only
-  // water cells. Falls back to a straight city-to-city line if a port is
-  // missing or the ports lie on unconnected water bodies (unreachable).
-  if (m === 'boat') {
-    const pi = cityPortCellArr[i], pj = cityPortCellArr[j];
-    if (pi < 0 || pj < 0) return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
-    const bprev = cache.perCity[i].prev;
-    const bcols = terrain.cols, bcellSize = terrain.cellSize;
-    const bpts = [];
-    let bcur = pj, bguard = 0, reached = false;
-    const bcap = terrain.cols * terrain.rows;
-    while (bcur !== -1 && bguard++ < bcap) {
-      const col = bcur % bcols, row = (bcur / bcols) | 0;
-      bpts.push({ x: (col + 0.5) * bcellSize, y: (row + 0.5) * bcellSize });
-      if (bcur === pi) { reached = true; break; }
-      bcur = bprev[bcur];
-    }
-    if (!reached) return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
-    bpts.reverse();
-    const full = [{ x: cities[i].x, y: cities[i].y }];
-    for (let p = 0; p < bpts.length; p++) full.push(bpts[p]);
-    full.push({ x: cities[j].x, y: cities[j].y });
-    return full;
-  }
-
   const prev = cache.perCity[i].prev;
   const cols = terrain.cols, cellSize = terrain.cellSize;
   const startCell = cityCellIdxArr[i], targetCell = cityCellIdxArr[j];
@@ -1180,17 +1224,82 @@ function reconstructPath(m, i, j) {
   return pts;
 }
 
+// The all-WATER polyline for a boat leg: portA center -> ... -> portB center,
+// walked down the port-cell boat Dijkstra prev[] chain (guaranteed water-only).
+// Falls back to a straight two-port segment on a cache miss / unreachable pair.
+function reconstructBoatWater(i, j) {
+  const cols = terrain.cols, cellSize = terrain.cellSize;
+  const pi = cityPortCellArr[i], pj = cityPortCellArr[j];
+  const pcA = { x: ((pi % cols) + 0.5) * cellSize, y: (((pi / cols) | 0) + 0.5) * cellSize };
+  const pcB = { x: ((pj % cols) + 0.5) * cellSize, y: (((pj / cols) | 0) + 0.5) * cellSize };
+  if (n > TERRAIN_DIJKSTRA_CAP || pi < 0 || pj < 0) return [pcA, pcB];
+  const cache = modeCache['boat'];
+  if (!cache || !cache.perCity[i]) return [pcA, pcB];
+  const prev = cache.perCity[i].prev;
+  const pts = [];
+  let cur = pj, guard = 0, reached = false;
+  const cap = terrain.cols * terrain.rows;
+  while (cur !== -1 && guard++ < cap) {
+    const col = cur % cols, row = (cur / cols) | 0;
+    pts.push({ x: (col + 0.5) * cellSize, y: (row + 0.5) * cellSize });
+    if (cur === pi) { reached = true; break; }
+    cur = prev[cur];
+  }
+  if (!reached) return [pcA, pcB];
+  pts.reverse();
+  return pts;
+}
+
+// The over-land CONNECTOR polyline for city i: city -> landing, routed over its
+// chosen ground mode (highway/train). Returns { mode, pts } or null when there
+// is nothing meaningful to draw (landlocked, or a coastal city whose landing is
+// its own cell => negligible connector). Falls back to a straight city->landing
+// segment on a cache miss / unreachable landing.
+function reconstructConnector(i) {
+  if (n > TERRAIN_DIJKSTRA_CAP || !terrain) return null;
+  const landing = cityLandingCellArr ? cityLandingCellArr[i] : -1;
+  if (landing < 0 || landing === cityCellIdxArr[i]) return null;
+  const gm = MODE_NAMES[cityConnectorModeArr[i]];
+  const cols = terrain.cols, cellSize = terrain.cellSize;
+  const landCenter = { x: ((landing % cols) + 0.5) * cellSize, y: (((landing / cols) | 0) + 0.5) * cellSize };
+  const cache = modeCache[gm];
+  if (!cache || !cache.perCity[i]) return { mode: gm, pts: [{ x: cities[i].x, y: cities[i].y }, landCenter] };
+  const prev = cache.perCity[i].prev;
+  const pts = [];
+  let cur = landing, guard = 0, reached = false;
+  const cap = terrain.cols * terrain.rows;
+  while (cur !== -1 && guard++ < cap) {
+    const col = cur % cols, row = (cur / cols) | 0;
+    pts.push({ x: (col + 0.5) * cellSize, y: (row + 0.5) * cellSize });
+    if (cur === cityCellIdxArr[i]) { reached = true; break; }
+    cur = prev[cur];
+  }
+  if (!reached) return { mode: gm, pts: [{ x: cities[i].x, y: cities[i].y }, landCenter] };
+  pts.reverse();
+  pts[0] = { x: cities[i].x, y: cities[i].y };
+  return pts.length >= 2 ? { mode: gm, pts: pts } : null;
+}
+
 function buildTourPathSegments(tour) {
   if (!terrain || !costMatrix || !tour || tour.length < 2) return null;
-  const segs = [], modes = [];
+  const segs = [], modes = [], connectors = [];
   for (let k = 0; k < tour.length; k++) {
     const i = tour[k], j = tour[(k + 1) % tour.length];
     let legMode = mode;
     if (mode === 'best' && modeMatrixArr) legMode = MODE_NAMES[modeMatrixArr[i * n + j]];
-    segs.push(reconstructPath(legMode, i, j));
+    if (legMode === 'boat') {
+      // A boat leg = land connector (city A) + all-water route + land connector
+      // (city B). segs[k] holds the water polyline; connectors[k] holds the two
+      // routed over-land approaches, each with its own ground mode for drawing.
+      segs.push(reconstructBoatWater(i, j));
+      connectors.push({ a: reconstructConnector(i), b: reconstructConnector(j) });
+    } else {
+      segs.push(reconstructPath(legMode, i, j));
+      connectors.push(null);
+    }
     modes.push(legMode);
   }
-  return { segs: segs, modes: modes };
+  return { segs: segs, modes: modes, connectors: connectors };
 }
 
 // Nearest-Neighbor construction from the designated start city (index 0),
@@ -1409,7 +1518,8 @@ function postProgress() {
     history: eng.history.slice(),
     genSinceImprovement: eng.genSinceImprovement,
     pathSegments: pathData !== undefined ? (pathData ? pathData.segs : null) : undefined,
-    legModes: pathData !== undefined ? (pathData ? pathData.modes : null) : undefined
+    legModes: pathData !== undefined ? (pathData ? pathData.modes : null) : undefined,
+    connectors: pathData !== undefined ? (pathData ? pathData.connectors : null) : undefined
   });
 }
 
@@ -1539,12 +1649,12 @@ self.onmessage = function (e) {
       ensureLoop();
       break;
     case 'computeNN': {
-      if (n < 2) { postMessage({ type: 'nnResult', workerId: workerId, tour: null, distance: null, pathSegments: null, legModes: null }); break; }
+      if (n < 2) { postMessage({ type: 'nnResult', workerId: workerId, tour: null, distance: null, pathSegments: null, legModes: null, connectors: null }); break; }
       const tour = nearestNeighborTour();
       const pd = (terrain && costMatrix) ? buildTourPathSegments(tour) : null;
       postMessage({
         type: 'nnResult', workerId: workerId, tour: tour, distance: tourDistance(tour),
-        pathSegments: pd ? pd.segs : null, legModes: pd ? pd.modes : null
+        pathSegments: pd ? pd.segs : null, legModes: pd ? pd.modes : null, connectors: pd ? pd.connectors : null
       });
       break;
     }
@@ -1615,6 +1725,7 @@ self.onmessage = function (e) {
         applyNNAsActive();
         state.pathSegments = msg.pathSegments || null;
         state.legModes = msg.legModes || null;
+        state.connectors = msg.connectors || null;
       }
       return;
     }
@@ -1637,6 +1748,7 @@ self.onmessage = function (e) {
       if (msg.pathSegments !== undefined) {
         state.pathSegments = msg.pathSegments;
         state.legModes = msg.legModes;
+        state.connectors = msg.connectors || null;
       }
     }
   }
@@ -1784,6 +1896,7 @@ self.onmessage = function (e) {
     state.ghostTour = null;
     state.pathSegments = null;
     state.legModes = null;
+    state.connectors = null;
     state.results.ga.distance = null;
     state.results.twoopt.distance = null;
     state.results.nn.distance = null;
@@ -2445,50 +2558,75 @@ self.onmessage = function (e) {
       return;
     }
 
-    const segs = state.pathSegments, modes = state.legModes || [];
-    for (let k = 0; k < segs.length; k++) {
-      const pts = segs[k];
-      if (!pts || pts.length < 2) continue;
-      const legMode = state.transportMode === 'best' ? modes[k] : state.transportMode;
-      const color = MODE_COLORS[legMode] || ACCENT;
+    const segs = state.pathSegments, modes = state.legModes || [], connectors = state.connectors || [];
+
+    function strokePolyline(pts, color, width) {
+      if (!pts || pts.length < 2) return;
       ctx.beginPath();
       for (let p = 0; p < pts.length; p++) {
         if (p === 0) ctx.moveTo(pts[p].x, pts[p].y); else ctx.lineTo(pts[p].x, pts[p].y);
       }
       ctx.strokeStyle = color;
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = width;
       ctx.shadowColor = color;
       ctx.shadowBlur = 12;
       ctx.stroke();
       ctx.shadowBlur = 0;
     }
 
-    if (state.transportMode === 'best' && tour.length <= 60) {
+    // Main leg polylines. For a boat leg segs[k] is the WATER route (boat
+    // color); its over-land approaches are drawn separately from connectors[k].
+    for (let k = 0; k < segs.length; k++) {
+      const legMode = state.transportMode === 'best' ? modes[k] : state.transportMode;
+      strokePolyline(segs[k], MODE_COLORS[legMode] || ACCENT, 2.5);
+      const conn = connectors[k];
+      if (conn) {
+        if (conn.a) strokePolyline(conn.a.pts, MODE_COLORS[conn.a.mode] || ACCENT, 2);
+        if (conn.b) strokePolyline(conn.b.pts, MODE_COLORS[conn.b.mode] || ACCENT, 2);
+      }
+    }
+
+    // Per-part mode glyphs. Boat legs show ⛴ on the water + 🚗/🚆 on each land
+    // connector (in Boat AND Best modes); non-boat legs keep the Best-mode-only
+    // midpoint glyph they had before.
+    if (tour.length <= 60) {
       for (let k = 0; k < segs.length; k++) {
-        const pts = segs[k];
-        if (!pts || pts.length < 2) continue;
-        const glyph = MODE_GLYPHS[modes[k]];
-        if (!glyph) continue;
-        const mid = pts[Math.floor(pts.length / 2)];
-        ctx.save();
-        ctx.font = '11px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = 'rgba(10,13,20,0.65)';
-        ctx.beginPath();
-        ctx.arc(mid.x, mid.y, 8, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#fff';
-        ctx.fillText(glyph, mid.x, mid.y + 0.5);
-        ctx.restore();
+        const legMode = state.transportMode === 'best' ? modes[k] : state.transportMode;
+        if (legMode === 'boat') {
+          drawLegGlyph(segs[k], MODE_GLYPHS.boat);
+          const conn = connectors[k];
+          if (conn) {
+            if (conn.a) drawLegGlyph(conn.a.pts, MODE_GLYPHS[conn.a.mode]);
+            if (conn.b) drawLegGlyph(conn.b.pts, MODE_GLYPHS[conn.b.mode]);
+          }
+        } else if (state.transportMode === 'best') {
+          drawLegGlyph(segs[k], MODE_GLYPHS[modes[k]]);
+        }
       }
     }
   }
 
-  // Port markers + dashed dock connectors. Only shown when boats can actually
-  // be used (Boat mode, or Best/multimodal which may pick boat per leg) so the
-  // map isn't cluttered with anchors when they're irrelevant. Landlocked
-  // cities (port === null) simply get no marker.
+  function drawLegGlyph(pts, glyph) {
+    if (!glyph || !pts || pts.length < 2) return;
+    const mid = pts[Math.floor(pts.length / 2)];
+    ctx.save();
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = 'rgba(10,13,20,0.65)';
+    ctx.beginPath();
+    ctx.arc(mid.x, mid.y, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillText(glyph, mid.x, mid.y + 0.5);
+    ctx.restore();
+  }
+
+  // Port markers only (the ⚓ ring at each city's port water cell). The over-
+  // land approach from city to port is now drawn as a REAL routed connector
+  // (highway/train) inside drawBestTourRoutes, not a dashed line here. Only
+  // shown when boats can actually be used (Boat mode, or Best/multimodal).
+  // Landlocked cities (port === null) simply get no marker.
   function drawPorts() {
     if (!state.terrain || !state.ports) return;
     if (state.transportMode !== 'boat' && state.transportMode !== 'best') return;
@@ -2496,16 +2634,6 @@ self.onmessage = function (e) {
     for (let i = 0; i < state.cities.length; i++) {
       const p = state.ports[i];
       if (!p) continue;
-      const c = state.cities[i];
-      // dashed dock line city -> port
-      ctx.beginPath();
-      ctx.setLineDash([3, 3]);
-      ctx.strokeStyle = 'rgba(56,189,248,0.5)';
-      ctx.lineWidth = 1;
-      ctx.moveTo(c.x, c.y);
-      ctx.lineTo(p.x, p.y);
-      ctx.stroke();
-      ctx.setLineDash([]);
       // port ring
       ctx.beginPath();
       ctx.fillStyle = 'rgba(10,13,20,0.7)';
