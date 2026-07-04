@@ -2622,35 +2622,53 @@ self.onmessage = function (e) {
     ctx.restore();
   }
 
-  // Port markers only (the ⚓ ring at each city's port water cell). The over-
-  // land approach from city to port is now drawn as a REAL routed connector
-  // (highway/train) inside drawBestTourRoutes, not a dashed line here. Only
-  // shown when boats can actually be used (Boat mode, or Best/multimodal).
-  // Landlocked cities (port === null) simply get no marker.
+  // City indices that are an ENDPOINT of a boat leg in the CURRENT best tour —
+  // the only cities whose port (⚓) is worth showing. Empty unless a boat can
+  // actually be used (Boat mode, or a Best/multimodal leg that chose boat), so
+  // in non-boat modes no ports are drawn at all.
+  function currentBoatPortSet() {
+    const set = new Set();
+    const tour = state.bestTour;
+    if (!tour || tour.length < 2) return set;
+    if (state.transportMode !== 'boat' && state.transportMode !== 'best') return set;
+    const modes = state.legModes || [];
+    for (let k = 0; k < tour.length; k++) {
+      const i = tour[k], j = tour[(k + 1) % tour.length];
+      const legMode = state.transportMode === 'best' ? modes[k] : state.transportMode;
+      if (legMode === 'boat') { set.add(i); set.add(j); }
+    }
+    return set;
+  }
+
+  // Port markers only (a small ⚓ ring at the port water cell), drawn ONLY for
+  // cities that are an endpoint of a boat leg in the current rendered tour — so
+  // the map isn't littered with an anchor on every coastal city. The over-land
+  // approach is drawn as a routed connector inside drawBestTourRoutes.
   function drawPorts() {
     if (!state.terrain || !state.ports) return;
-    if (state.transportMode !== 'boat' && state.transportMode !== 'best') return;
+    const portSet = currentBoatPortSet();
+    if (portSet.size === 0) return;
     ctx.save();
-    for (let i = 0; i < state.cities.length; i++) {
+    portSet.forEach(function (i) {
       const p = state.ports[i];
-      if (!p) continue;
-      // port ring
+      if (!p) return;
+      // small port ring
       ctx.beginPath();
-      ctx.fillStyle = 'rgba(10,13,20,0.7)';
-      ctx.arc(p.x, p.y, 6.5, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(10,13,20,0.6)';
+      ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
       ctx.fill();
       ctx.beginPath();
-      ctx.strokeStyle = 'rgba(56,189,248,0.9)';
-      ctx.lineWidth = 1.4;
-      ctx.arc(p.x, p.y, 6.5, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(56,189,248,0.8)';
+      ctx.lineWidth = 1.1;
+      ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
       ctx.stroke();
       // anchor glyph
-      ctx.font = '9px sans-serif';
+      ctx.font = '7px sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#dff2ff';
       ctx.fillText('⚓', p.x, p.y + 0.5);
-    }
+    });
     ctx.restore();
   }
 
@@ -2711,7 +2729,12 @@ self.onmessage = function (e) {
     }
 
     if (state.cities.length >= 2) {
-      drawTourPath(state.ghostTour, GHOST_COLOR, 1, false);
+      // The faint "ghost" of the initial messy tour is drawn as STRAIGHT city-
+      // to-city segments — meaningful only on the flat map. On terrain maps
+      // those straight lines cut dead-straight across ocean and over mountains,
+      // ignoring the routed paths and cluttering the map, so suppress the ghost
+      // there entirely and only show the bright routed best tour.
+      if (!state.terrain) drawTourPath(state.ghostTour, GHOST_COLOR, 1, false);
       drawBestTourRoutes();
     }
     drawPorts();
@@ -3005,6 +3028,14 @@ self.onmessage = function (e) {
     renderChart();
     updateStatsUI();
   }
+
+  // Read-only diagnostics hook for automated verification only; recomputes on
+  // demand and does not affect rendering or state.
+  window.__tspDebug = {
+    portStats: function () {
+      return { cityCount: state.cities.length, portCount: currentBoatPortSet().size, mode: state.transportMode };
+    }
+  };
 
   // =========================================================================
   // Boot
