@@ -314,6 +314,32 @@
     display:block;
   }
 
+  /* ---------- Legend ---------- */
+  .legend-grid{
+    display:flex;
+    flex-wrap:wrap;
+    gap:6px;
+  }
+  .legend-chip{
+    font-size:11px;
+    color:var(--muted);
+    display:inline-flex;
+    align-items:center;
+    gap:5px;
+    background:#0e1422;
+    border:1px solid var(--border);
+    border-radius:999px;
+    padding:3px 9px 3px 6px;
+    line-height:1.6;
+  }
+  .legend-chip i{
+    width:9px;
+    height:9px;
+    border-radius:50%;
+    display:inline-block;
+    flex:0 0 auto;
+  }
+
   footer.credit{
     font-size:10.5px;
     color:var(--muted);
@@ -332,7 +358,7 @@
 
   <header class="topbar">
     <h1>TSP Genetic Solver</h1>
-    <span class="tagline">Genetic algorithm + 2-opt local search — watch the shortest loop untangle itself</span>
+    <span class="tagline">Genetic algorithm + 2-opt local search — now routing across real terrain and transport modes</span>
   </header>
 
   <div class="app">
@@ -382,7 +408,36 @@
         <div class="row-inline">
           <button id="copyLinkBtn">Copy Link</button>
         </div>
-        <div class="hint">Copies a URL that reproduces the exact same cities.</div>
+        <div class="hint">Copies a URL that reproduces the exact same cities, world and mode.</div>
+      </div>
+
+      <div class="section">
+        <h2>World</h2>
+        <label class="field">
+          <div class="field-head"><span>Map type</span></div>
+          <select id="mapTypeSelect">
+            <option value="continent" selected>Continent</option>
+            <option value="islands">Islands</option>
+            <option value="river">River valley</option>
+            <option value="mountains">Mountains</option>
+            <option value="flat">Flat (no terrain)</option>
+          </select>
+        </label>
+        <div class="row-inline">
+          <button id="regenerateBtn">&#8635; New Map</button>
+          <span class="hint">Seed: <span id="seedDisplay">—</span></span>
+        </div>
+        <label class="field">
+          <div class="field-head"><span>Transport mode</span></div>
+          <select id="transportModeSelect">
+            <option value="best" selected>Best (multimodal)</option>
+            <option value="highway">&#128663; Highway</option>
+            <option value="train">&#128646; Train</option>
+            <option value="boat">&#9974; Boat</option>
+            <option value="plane">&#9992; Plane</option>
+          </select>
+        </label>
+        <div class="hint">Tour cost now respects terrain: routes bend around mountains, hug coasts and rivers, and (in Best mode) pick the cheapest transport per leg.</div>
       </div>
 
       <div class="section">
@@ -457,7 +512,26 @@
         </div>
       </div>
 
-      <footer class="credit">Vanilla JS · GA + 2-opt + NN · Web Worker · single file, no dependencies</footer>
+      <div class="section">
+        <h2>Legend</h2>
+        <div class="legend-grid">
+          <span class="legend-chip"><i style="background:#8da360;"></i>Plains</span>
+          <span class="legend-chip"><i style="background:#3a6140;"></i>Forest</span>
+          <span class="legend-chip"><i style="background:#807052;"></i>Hills</span>
+          <span class="legend-chip"><i style="background:#c9c4c8;"></i>Mountain</span>
+          <span class="legend-chip"><i style="background:#c7b68a;"></i>Coast</span>
+          <span class="legend-chip"><i style="background:#123a5c;"></i>Ocean</span>
+          <span class="legend-chip"><i style="background:#46a2e6;"></i>River</span>
+        </div>
+        <div class="legend-grid">
+          <span class="legend-chip"><i style="background:#f5a623;"></i>&#128663; Highway</span>
+          <span class="legend-chip"><i style="background:#9b6bff;"></i>&#128646; Train</span>
+          <span class="legend-chip"><i style="background:#38bdf8;"></i>&#9974; Boat</span>
+          <span class="legend-chip"><i style="background:#ff6b9d;"></i>&#9992; Plane</span>
+        </div>
+      </div>
+
+      <footer class="credit">Vanilla JS · GA + 2-opt + NN · terrain + multimodal routing · Web Worker · single file, no dependencies</footer>
     </aside>
   </div>
 
@@ -485,6 +559,11 @@
   const presetSelect = document.getElementById('presetSelect');
   const copyLinkBtn = document.getElementById('copyLinkBtn');
 
+  const mapTypeSelect = document.getElementById('mapTypeSelect');
+  const regenerateBtn = document.getElementById('regenerateBtn');
+  const seedDisplay = document.getElementById('seedDisplay');
+  const transportModeSelect = document.getElementById('transportModeSelect');
+
   const speedSlider = document.getElementById('speedSlider');
   const speedValue = document.getElementById('speedValue');
   const popSlider = document.getElementById('popSlider');
@@ -507,6 +586,29 @@
   const compareCardNN = document.getElementById('compareCardNN');
 
   // =========================================================================
+  // Terrain + transport constants (main-thread copy — the worker keeps an
+  // identical, independently-defined copy inside workerSrc since it can't
+  // reach this closure; only the numeric cellType/riverMask VALUES actually
+  // cross the postMessage boundary, so both copies must stay in sync by hand).
+  // =========================================================================
+  const TERRAIN_OCEAN = 0, TERRAIN_COAST = 1, TERRAIN_PLAINS = 2, TERRAIN_FOREST = 3, TERRAIN_HILLS = 4, TERRAIN_MOUNTAIN = 5;
+  const MAP_TYPE_VALUES = ['continent', 'islands', 'river', 'mountains', 'flat'];
+  const MODE_VALUES = ['best', 'highway', 'train', 'boat', 'plane'];
+  const MODE_COLORS = { highway: '#f5a623', train: '#9b6bff', boat: '#38bdf8', plane: '#ff6b9d' };
+  const MODE_GLYPHS = { highway: '🚗', train: '🚆', boat: '⚓', plane: '✈' };
+
+  // City-count performance ceilings for terrain-aware costing, mirrored in
+  // the worker (see the matching constants + comment inside workerSrc). Only
+  // used here to pick a grid resolution that's cheap enough for the current
+  // city count — the authoritative cap enforcement happens in the worker.
+  const TERRAIN_DIJKSTRA_CAP = 120;
+
+  const ACCENT = '#3fe6cf';
+  const START_COLOR = '#ffb454';
+  const CITY_COLOR = '#e8ecf6';
+  const GHOST_COLOR = 'rgba(150,160,255,0.16)';
+
+  // =========================================================================
   // Global state
   //
   // CONTRACT: city coordinates are immutable pins. A city, once placed, never
@@ -520,10 +622,16 @@
   // so that any accidental `city.x = ...` / `city.y = ...` write anywhere
   // (main thread OR inside the worker) throws a TypeError under strict mode
   // instead of silently corrupting the map.
+  //
+  // The same contract now covers terrain: state.terrain (once generated) is
+  // Object.freeze()-d, including every typed array hanging off it, in
+  // generateTerrain() below. The solver reorders city indices and reads a
+  // precomputed cost matrix built FROM terrain — it never mutates terrain or
+  // city coordinates, in the worker or here.
   // =========================================================================
   const state = {
     cities: [],            // {x,y} in CSS-pixel coords relative to canvas top-left; frozen, read-only
-    distMatrix: null,      // flattened Float64Array, n*n, precomputed pairwise distances (main thread copy, used for NN baseline)
+    distMatrix: null,      // flattened Float64Array, n*n, precomputed pairwise EUCLIDEAN distances (main thread copy; only used for the instant NN baseline on the Flat map)
     n: 0,
     algo: 'ga',             // 'ga' | '2opt' | 'nn' — which solver is currently active/animating
     popSize: parseInt(popSlider.value, 10),
@@ -541,21 +649,25 @@
       ga: { distance: null },
       twoopt: { distance: null },
       nn: { distance: null, tour: null }
-    }
+    },
+
+    // ---- terrain + transport (new) ----
+    terrain: null,          // frozen {seed,mapType,cellSize,cols,rows,worldW,worldH,elevation,moisture,cellType,riverMask} or null (Flat map)
+    mapType: 'continent',
+    seed: 0,
+    transportMode: 'best',  // 'best' | 'highway' | 'train' | 'boat' | 'plane'
+    pathSegments: null,     // array of per-leg point arrays for the CURRENT best tour, as reported by the worker (terrain-aware routing only)
+    legModes: null          // parallel array of winning-mode strings per leg (only meaningful in 'best' mode)
   };
 
-  const ACCENT = '#3fe6cf';
-  const START_COLOR = '#ffb454';
-  const CITY_COLOR = '#e8ecf6';
-  const GHOST_COLOR = 'rgba(150,160,255,0.16)';
-
   // =========================================================================
-  // Worker source: the GA, 2-opt, and nearest-neighbor solver logic,
-  // duplicated/adapted to run standalone inside a Web Worker built from an
-  // inline Blob URL (workers can't reach the DOM or this closure, so
-  // everything it needs — city coords, params, commands — travels over
-  // postMessage). It only ever permutes arrays of integer city indices; it
-  // never writes to a city's x/y.
+  // Worker source: the GA, 2-opt, nearest-neighbor, and terrain-aware costing
+  // logic, duplicated/adapted to run standalone inside a Web Worker built
+  // from an inline Blob URL (workers can't reach the DOM or this closure, so
+  // everything it needs — city coords, terrain, params, commands — travels
+  // over postMessage). It only ever permutes arrays of integer city indices;
+  // it never writes to a city's x/y, and never writes to the terrain arrays
+  // it receives.
   // =========================================================================
   const workerSrc = `
 'use strict';
@@ -565,9 +677,23 @@
 // fine: this worker treats it as read-only regardless). Tours are always
 // plain arrays of integer indices into this array. Nothing in this file ever
 // assigns to city.x or city.y.
+//
+// Terrain arrives the same way: a structured-cloned copy of the frozen
+// main-thread terrain object (or null for the Flat/no-terrain map). The
+// clone is technically mutable (postMessage strips the freeze), but by
+// contract nothing here ever writes to it either — it is read-only input,
+// exactly like cities.
 let cities = [];
-let distMatrix = null;
+let distMatrix = null;    // Euclidean n*n — always built; the Flat-map cost source and the Plane closed-form input
+let costMatrix = null;    // terrain/mode-aware n*n — null whenever terrain is absent or the city count exceeds TERRAIN_LINEAPPROX_CAP
+let modeMatrixArr = null; // n*n Uint8Array of winning-mode ids, only populated in 'best' mode
 let n = 0;
+
+let terrain = null;       // {cols, rows, cellSize, cellType, riverMask} or null (Flat map)
+let terrainVersion = 0;   // bumped on every terrain change so per-mode Dijkstra caches invalidate
+let mode = 'best';        // 'best' | 'highway' | 'train' | 'boat' | 'plane'
+let cityCellIdxArr = null; // Int32Array n — which terrain grid cell each city sits in
+let modeCache = {};       // { [groundMode]: { terrainVersion, cellCost: Float64Array, perCity: [{dist,prev}, ...] } }
 
 let algo = 'ga';          // 'ga' | '2opt'
 let running = false;
@@ -575,9 +701,42 @@ let popSize = 120;
 let mutationRate = 0.08;
 let batchSize = 5;
 let workerId = null;
+let progressTick = 0;
 
 const TOURNAMENT_K = 5;
 const MAX_HISTORY_POINTS = 400;
+
+// ---------- terrain / transport constants ----------
+// Cell-type enum — MUST stay in sync with the identical constants in the
+// main-thread script (duplicated, not shared, because the worker and the
+// page are separate execution contexts). Only the numeric values inside the
+// cloned terrain.cellType typed array actually travel across.
+const T_OCEAN = 0, T_COAST = 1, T_PLAINS = 2, T_FOREST = 3, T_HILLS = 4, T_MOUNTAIN = 5;
+
+const GROUND_MODES = ['highway', 'train', 'boat'];
+const MODE_IDS = { highway: 0, train: 1, boat: 2, plane: 3 };
+const MODE_NAMES = ['highway', 'train', 'boat', 'plane'];
+
+// Per-mode traversal cost by cell type, indexed [OCEAN, COAST, PLAINS, FOREST, HILLS, MOUNTAIN].
+const TRAVERSAL = {
+  highway: [Infinity, 1.2, 1, 1.8, 2.8, 7],
+  train:   [Infinity, 1.3, 1, 1.5, 3.5, 10],
+  boat:    [1, 1.6, Infinity, Infinity, Infinity, Infinity]
+};
+const RIVER_BRIDGE_COST = { highway: 3, train: 3 }; // crossing a river cell on land = a bridge
+const RIVER_BOAT_COST = 1.2;                        // boats can also sail rivers
+const PLANE_AIR_FACTOR = 0.95;
+const PLANE_SURCHARGE = 220; // fixed takeoff/landing overhead — planes only pay off on long or terrain-blocked hauls
+const UNREACHABLE_PENALTY = 1e6; // large-but-finite stand-in for "no path" so the GA can still rank tours
+
+// City-count performance ceilings for terrain-aware costing. Deliberate,
+// documented caps rather than bugs:
+//   n <= TERRAIN_DIJKSTRA_CAP                          -> exact per-city Dijkstra + real bent routes
+//   TERRAIN_DIJKSTRA_CAP  <  n <= TERRAIN_LINEAPPROX_CAP -> cheap line-marched cost approximation, straight-line rendering
+//   n  >  TERRAIN_LINEAPPROX_CAP                        -> terrain-aware costing skipped entirely, falls back to plain
+//                                                          Euclidean (identical to Flat) so huge city counts never freeze the app
+const TERRAIN_DIJKSTRA_CAP = 120;
+const TERRAIN_LINEAPPROX_CAP = 500;
 
 let ga = null;      // { population, generation, bestTour, bestDistance, initialDistance, ghostTour, history, genSinceImprovement }
 let twoOpt = null;  // { tour, distance, initialDistance, ghostTour, generation, history, genSinceImprovement }
@@ -610,7 +769,14 @@ function buildDistanceMatrix() {
   }
   distMatrix = mat;
 }
-function d(i, j) { return distMatrix[i * n + j]; }
+
+// d(i,j) is the ONE place every solver reads pairwise cost from. It is
+// terrain/mode-aware whenever a cost matrix has been built (see
+// recomputeCosts) and falls back to plain Euclidean distance otherwise —
+// which is exactly the original, pre-terrain behavior, so the Flat map (and
+// any city count above the perf caps above) reproduces the old app exactly.
+function d(i, j) { return costMatrix ? costMatrix[i * n + j] : distMatrix[i * n + j]; }
+
 function tourDistance(tour) {
   const len = tour.length;
   if (len < 2) return 0;
@@ -619,8 +785,261 @@ function tourDistance(tour) {
   return total;
 }
 
+// ---------- terrain costing ----------
+function cityToCellIdx() {
+  const cols = terrain.cols, rows = terrain.rows, cellSize = terrain.cellSize;
+  const arr = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    let col = Math.floor(cities[i].x / cellSize);
+    let row = Math.floor(cities[i].y / cellSize);
+    if (col < 0) col = 0; else if (col >= cols) col = cols - 1;
+    if (row < 0) row = 0; else if (row >= rows) row = rows - 1;
+    arr[i] = row * cols + col;
+  }
+  return arr;
+}
+
+function cellTraversalCost(m, idx) {
+  const type = terrain.cellType[idx];
+  const isRiver = terrain.riverMask[idx] === 1;
+  if (m === 'boat') return isRiver ? RIVER_BOAT_COST : TRAVERSAL.boat[type];
+  if (isRiver) return RIVER_BRIDGE_COST[m];
+  return TRAVERSAL[m][type];
+}
+
+function buildCellCostGrid(m) {
+  const cellCount = terrain.cols * terrain.rows;
+  const grid = new Float64Array(cellCount);
+  for (let i = 0; i < cellCount; i++) grid[i] = cellTraversalCost(m, i);
+  return grid;
+}
+
+// Binary min-heap of (dist, cellIdx) pairs — keeps Dijkstra at O(E log V)
+// instead of the O(V^2) a plain linear scan would cost at many thousands of cells.
+function MinHeap() { this.d = []; this.ix = []; }
+MinHeap.prototype.push = function (dist, idx) {
+  const d = this.d, ix = this.ix;
+  d.push(dist); ix.push(idx);
+  let c = d.length - 1;
+  while (c > 0) {
+    const p = (c - 1) >> 1;
+    if (d[p] <= d[c]) break;
+    const td = d[p]; d[p] = d[c]; d[c] = td;
+    const ti = ix[p]; ix[p] = ix[c]; ix[c] = ti;
+    c = p;
+  }
+};
+MinHeap.prototype.pop = function () {
+  const d = this.d, ix = this.ix;
+  const topD = d[0], topI = ix[0];
+  const lastD = d.pop(), lastI = ix.pop();
+  if (d.length > 0) {
+    d[0] = lastD; ix[0] = lastI;
+    let p = 0;
+    const len = d.length;
+    for (;;) {
+      const l = p * 2 + 1, r = l + 1;
+      let s = p;
+      if (l < len && d[l] < d[s]) s = l;
+      if (r < len && d[r] < d[s]) s = r;
+      if (s === p) break;
+      const td = d[p]; d[p] = d[s]; d[s] = td;
+      const ti = ix[p]; ix[p] = ix[s]; ix[s] = ti;
+      p = s;
+    }
+  }
+  return { dist: topD, idx: topI };
+};
+MinHeap.prototype.size = function () { return this.d.length; };
+
+const NEI_DX = [-1, 0, 1, -1, 1, -1, 0, 1];
+const NEI_DY = [-1, -1, -1, 0, 0, 1, 1, 1];
+const NEI_LEN = [Math.SQRT2, 1, Math.SQRT2, 1, 1, Math.SQRT2, 1, Math.SQRT2];
+
+// 8-neighbour Dijkstra from a single grid cell. Step cost = average of the
+// two cells' traversal cost * geometric step length (in px, so diagonal
+// steps cost sqrt(2) as much as orthogonal ones). Cells with Infinity cost
+// are simply never relaxed into — impassable.
+function dijkstraFrom(startIdx, cellCost) {
+  const cols = terrain.cols, rows = terrain.rows;
+  const cellCount = cols * rows;
+  const dist = new Float64Array(cellCount).fill(Infinity);
+  const prev = new Int32Array(cellCount).fill(-1);
+  const visited = new Uint8Array(cellCount);
+  dist[startIdx] = 0;
+  const heap = new MinHeap();
+  heap.push(0, startIdx);
+  const cellSize = terrain.cellSize;
+  while (heap.size()) {
+    const top = heap.pop();
+    const idx = top.idx;
+    if (visited[idx]) continue;
+    if (top.dist > dist[idx] + 1e-9) continue;
+    visited[idx] = 1;
+    const cx = idx % cols, cy = (idx / cols) | 0;
+    for (let k = 0; k < 8; k++) {
+      const nx = cx + NEI_DX[k], ny = cy + NEI_DY[k];
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+      const nIdx = ny * cols + nx;
+      if (visited[nIdx]) continue;
+      const cc = cellCost[nIdx];
+      if (!isFinite(cc)) continue;
+      const here = cellCost[idx];
+      const avg = isFinite(here) ? (here + cc) / 2 : cc;
+      const stepCost = avg * NEI_LEN[k] * cellSize;
+      const nd = dist[idx] + stepCost;
+      if (nd < dist[nIdx]) { dist[nIdx] = nd; prev[nIdx] = idx; heap.push(nd, nIdx); }
+    }
+  }
+  return { dist: dist, prev: prev };
+}
+
+function ensureModeReady(m) {
+  const cached = modeCache[m];
+  if (cached && cached.terrainVersion === terrainVersion) return;
+  const cellCost = buildCellCostGrid(m);
+  const perCity = [];
+  if (n <= TERRAIN_DIJKSTRA_CAP) {
+    for (let i = 0; i < n; i++) perCity.push(dijkstraFrom(cityCellIdxArr[i], cellCost));
+  }
+  modeCache[m] = { terrainVersion: terrainVersion, cellCost: cellCost, perCity: perCity };
+}
+
+// Cheap fallback for large city counts: march along the straight line between
+// two cities in the terrain grid and sum cost-weighted step lengths, instead
+// of a full per-city Dijkstra. It won't route AROUND obstacles, only price
+// what's actually along the direct line — a reasonable approximation once
+// there are too many cities for N full grid searches to stay fast.
+function lineMarchCost(m, cellCost, i, j) {
+  const a = cities[i], b = cities[j];
+  const cols = terrain.cols, rows = terrain.rows, cellSize = terrain.cellSize;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const dist = Math.hypot(dx, dy);
+  const steps = Math.max(4, Math.min(80, Math.round(dist / cellSize)));
+  let total = 0, blocked = 0, prevCost = null;
+  for (let s = 0; s <= steps; s++) {
+    const t = s / steps;
+    let col = Math.floor((a.x + dx * t) / cellSize);
+    let row = Math.floor((a.y + dy * t) / cellSize);
+    if (col < 0) col = 0; else if (col >= cols) col = cols - 1;
+    if (row < 0) row = 0; else if (row >= rows) row = rows - 1;
+    const cc = cellCost[row * cols + col];
+    if (!isFinite(cc)) { blocked++; continue; }
+    if (prevCost !== null) total += ((prevCost + cc) / 2) * (dist / steps);
+    prevCost = cc;
+  }
+  if (blocked > steps * 0.3) return UNREACHABLE_PENALTY;
+  return total > 0 ? total : dist;
+}
+
+function costBetweenGround(m, i, j) {
+  const cache = modeCache[m];
+  if (n <= TERRAIN_DIJKSTRA_CAP) {
+    const dd = cache.perCity[i].dist[cityCellIdxArr[j]];
+    return isFinite(dd) ? dd : UNREACHABLE_PENALTY;
+  }
+  return lineMarchCost(m, cache.cellCost, i, j);
+}
+
+function costPlane(i, j) { return distMatrix[i * n + j] * PLANE_AIR_FACTOR + PLANE_SURCHARGE; }
+
+function recomputeCosts() {
+  costMatrix = null;
+  modeMatrixArr = null;
+  if (!terrain || n < 2) return;
+  if (n > TERRAIN_LINEAPPROX_CAP) return; // see TERRAIN_LINEAPPROX_CAP comment above — falls back to Euclidean
+
+  cityCellIdxArr = cityToCellIdx();
+
+  if (mode === 'plane') {
+    const mat = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) mat[i * n + j] = (i === j) ? 0 : costPlane(i, j);
+    costMatrix = mat;
+    return;
+  }
+
+  if (mode === 'best') {
+    for (let g = 0; g < GROUND_MODES.length; g++) ensureModeReady(GROUND_MODES[g]);
+    const mat = new Float64Array(n * n);
+    const modeOf = new Uint8Array(n * n);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        if (i === j) { mat[i * n + j] = 0; modeOf[i * n + j] = MODE_IDS.highway; continue; }
+        let bestCost = Infinity, bestMode = MODE_IDS.highway;
+        for (let g = 0; g < GROUND_MODES.length; g++) {
+          const gm = GROUND_MODES[g];
+          const c = costBetweenGround(gm, i, j);
+          if (c < bestCost) { bestCost = c; bestMode = MODE_IDS[gm]; }
+        }
+        const pc = costPlane(i, j);
+        if (pc < bestCost) { bestCost = pc; bestMode = MODE_IDS.plane; }
+        mat[i * n + j] = bestCost;
+        modeOf[i * n + j] = bestMode;
+      }
+    }
+    costMatrix = mat;
+    modeMatrixArr = modeOf;
+    return;
+  }
+
+  // single ground mode ('highway' | 'train' | 'boat')
+  ensureModeReady(mode);
+  const mat = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) mat[i * n + j] = (i === j) ? 0 : costBetweenGround(mode, i, j);
+  }
+  costMatrix = mat;
+}
+
+// Reconstructs the actual routed path (grid-cell centers) for one leg under
+// one mode, by walking the Dijkstra prev[] chain backwards from j to i. Falls
+// back to a plain two-point straight segment for Plane, for city counts above
+// TERRAIN_DIJKSTRA_CAP (no per-city Dijkstra was run), or on any cache miss —
+// rendering never crashes, that one leg just looks straight instead of bent.
+function reconstructPath(m, i, j) {
+  if (m === 'plane' || n > TERRAIN_DIJKSTRA_CAP || !terrain) {
+    return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
+  }
+  const cache = modeCache[m];
+  if (!cache || !cache.perCity[i]) {
+    return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
+  }
+  const prev = cache.perCity[i].prev;
+  const cols = terrain.cols, cellSize = terrain.cellSize;
+  const startCell = cityCellIdxArr[i], targetCell = cityCellIdxArr[j];
+  const pts = [];
+  let cur = targetCell, guard = 0;
+  const cap = terrain.cols * terrain.rows;
+  while (cur !== -1 && guard++ < cap) {
+    const col = cur % cols, row = (cur / cols) | 0;
+    pts.push({ x: (col + 0.5) * cellSize, y: (row + 0.5) * cellSize });
+    if (cur === startCell) break;
+    cur = prev[cur];
+  }
+  pts.reverse();
+  if (pts.length < 2) return [{ x: cities[i].x, y: cities[i].y }, { x: cities[j].x, y: cities[j].y }];
+  pts[0] = { x: cities[i].x, y: cities[i].y };
+  pts[pts.length - 1] = { x: cities[j].x, y: cities[j].y };
+  return pts;
+}
+
+function buildTourPathSegments(tour) {
+  if (!terrain || !costMatrix || !tour || tour.length < 2) return null;
+  const segs = [], modes = [];
+  for (let k = 0; k < tour.length; k++) {
+    const i = tour[k], j = tour[(k + 1) % tour.length];
+    let legMode = mode;
+    if (mode === 'best' && modeMatrixArr) legMode = MODE_NAMES[modeMatrixArr[i * n + j]];
+    segs.push(reconstructPath(legMode, i, j));
+    modes.push(legMode);
+  }
+  return { segs: segs, modes: modes };
+}
+
 // Nearest-Neighbor construction from the designated start city (index 0),
-// used as the initial tour for the 2-opt demo.
+// used as the initial tour for the 2-opt demo AND as the one-shot NN
+// baseline whenever terrain makes the main thread's plain-Euclidean copy
+// inaccurate (see the 'computeNN' command below).
 function nearestNeighborTour() {
   const visited = new Array(n).fill(false);
   const tour = [0];
@@ -803,9 +1222,21 @@ function stepTwoOpt() {
 // ---------- messaging ----------
 function currentEngine() { return algo === 'ga' ? ga : twoOpt; }
 
+// Path segments are only rebuilt every few progress posts (they're a
+// render-only nicety, not something the solver needs) so terrain-aware city
+// counts near TERRAIN_DIJKSTRA_CAP don't spend most of their time walking
+// prev[] chains instead of evolving.
 function postProgress() {
   const eng = currentEngine();
   if (!eng) return;
+  const tour = (algo === 'ga' ? eng.bestTour : eng.tour);
+  progressTick++;
+  let pathData; // undefined = "not recomputed this tick, main thread keeps its previous copy"
+  if (!terrain || !costMatrix) {
+    pathData = null;
+  } else if (progressTick % 4 === 0 || eng.generation <= 1) {
+    pathData = buildTourPathSegments(tour);
+  }
   postMessage({
     type: 'progress',
     workerId: workerId,
@@ -813,10 +1244,12 @@ function postProgress() {
     generation: eng.generation,
     distance: algo === 'ga' ? eng.bestDistance : eng.distance,
     initialDistance: eng.initialDistance,
-    bestTourIndices: (algo === 'ga' ? eng.bestTour : eng.tour).slice(),
+    bestTourIndices: tour.slice(),
     ghostTourIndices: eng.ghostTour ? eng.ghostTour.slice() : null,
     history: eng.history.slice(),
-    genSinceImprovement: eng.genSinceImprovement
+    genSinceImprovement: eng.genSinceImprovement,
+    pathSegments: pathData !== undefined ? (pathData ? pathData.segs : null) : undefined,
+    legModes: pathData !== undefined ? (pathData ? pathData.modes : null) : undefined
   });
 }
 
@@ -861,7 +1294,11 @@ self.onmessage = function (e) {
       batchSize = msg.batchSize;
       algo = msg.algo;
       running = !!msg.running;
-      if (n >= 2) buildDistanceMatrix();
+      terrain = msg.terrain || null;
+      mode = msg.mode || 'best';
+      terrainVersion++;
+      modeCache = {};
+      if (n >= 2) { buildDistanceMatrix(); recomputeCosts(); }
       reinitActiveAlgo();
       ensureLoop();
       break;
@@ -889,18 +1326,43 @@ self.onmessage = function (e) {
         reinitActiveAlgo();
       }
       break;
+    case 'setTerrain':
+      terrain = msg.terrain || null;
+      terrainVersion++;
+      modeCache = {};
+      recomputeCosts();
+      reinitActiveAlgo();
+      ensureLoop();
+      break;
+    case 'setMode':
+      mode = msg.mode || 'best';
+      recomputeCosts();
+      reinitActiveAlgo();
+      ensureLoop();
+      break;
+    case 'computeNN': {
+      if (n < 2) { postMessage({ type: 'nnResult', workerId: workerId, tour: null, distance: null, pathSegments: null, legModes: null }); break; }
+      const tour = nearestNeighborTour();
+      const pd = (terrain && costMatrix) ? buildTourPathSegments(tour) : null;
+      postMessage({
+        type: 'nnResult', workerId: workerId, tour: tour, distance: tourDistance(tour),
+        pathSegments: pd ? pd.segs : null, legModes: pd ? pd.modes : null
+      });
+      break;
+    }
   }
 };
 `;
 
   // =========================================================================
-  // Web Worker: all GA / 2-opt generation-stepping happens off the main
-  // thread. The main thread only renders (canvas draw using city coords it
-  // already holds + an index permutation received from the worker) and
-  // handles input. `workerId` guards against stale messages from a
+  // Web Worker: all GA / 2-opt generation-stepping (and now all terrain-aware
+  // costing) happens off the main thread. The main thread only renders
+  // (canvas draw using city coords + terrain it already holds, plus an index
+  // permutation and optional routed-path segments received from the worker)
+  // and handles input. `workerId` guards against stale messages from a
   // just-terminated worker instance; `workerAlgo` tracks which algorithm the
   // live worker instance is currently running ('ga' or '2opt' — 'nn' never
-  // runs in the worker, it's one-shot and computed on the main thread).
+  // "runs" continuously in the worker, it's requested as a one-shot).
   // =========================================================================
   let worker = null;
   let workerAlgo = null;
@@ -909,6 +1371,15 @@ self.onmessage = function (e) {
   function terminateWorker() {
     if (worker) { worker.terminate(); worker = null; }
     workerAlgo = null;
+  }
+
+  // Terrain is sent to the worker stripped down to just what costing needs
+  // (cols/rows/cellSize/cellType/riverMask) — elevation/moisture only matter
+  // for main-thread rendering, so there's no reason to structured-clone them
+  // across every worker init.
+  function serializeTerrainForWorker(t) {
+    if (!t) return null;
+    return { cols: t.cols, rows: t.rows, cellSize: t.cellSize, cellType: t.cellType, riverMask: t.riverMask };
   }
 
   function spawnWorker() {
@@ -929,12 +1400,27 @@ self.onmessage = function (e) {
       popSize: state.popSize,
       mutationRate: state.mutationRate,
       batchSize: state.gensPerFrame,
-      running: state.running && state.algo !== 'nn'
+      running: state.running && state.algo !== 'nn',
+      terrain: serializeTerrainForWorker(state.terrain),
+      mode: state.transportMode
     });
   }
 
   function handleWorkerMessage(e) {
     const msg = e.data;
+
+    if (msg.type === 'nnResult') {
+      if (msg.workerId !== workerId) return; // stale worker instance
+      state.results.nn.tour = msg.tour;
+      state.results.nn.distance = msg.distance;
+      if (state.algo === 'nn') {
+        applyNNAsActive();
+        state.pathSegments = msg.pathSegments || null;
+        state.legModes = msg.legModes || null;
+      }
+      return;
+    }
+
     if (msg.type !== 'progress') return;
     if (msg.workerId !== workerId) return;   // message from a stale/terminated worker
     if (msg.algo !== workerAlgo) return;     // message from before an algo switch settled
@@ -950,6 +1436,10 @@ self.onmessage = function (e) {
       state.ghostTour = msg.ghostTourIndices;
       state.genSinceImprovement = msg.genSinceImprovement;
       state.history = msg.history;
+      if (msg.pathSegments !== undefined) {
+        state.pathSegments = msg.pathSegments;
+        state.legModes = msg.legModes;
+      }
     }
   }
 
@@ -965,7 +1455,8 @@ self.onmessage = function (e) {
 
   // =========================================================================
   // Small utilities (main-thread copies; only used for the one-shot Nearest
-  // Neighbor baseline, which is cheap enough to run synchronously here)
+  // Neighbor baseline on the Flat map, which is cheap enough to run
+  // synchronously here — exactly as before terrain was added)
   // =========================================================================
   function distBetween(p, q) {
     return Math.hypot(p.x - q.x, p.y - q.y);
@@ -973,7 +1464,7 @@ self.onmessage = function (e) {
 
   // =========================================================================
   // Distance matrix (main-thread copy, used only to score the Nearest
-  // Neighbor baseline instantly whenever the city set changes)
+  // Neighbor baseline instantly on the Flat map, whenever the city set changes)
   // =========================================================================
   function buildDistanceMatrix() {
     const n = state.cities.length;
@@ -1005,7 +1496,9 @@ self.onmessage = function (e) {
 
   // Nearest-Neighbor construction starting from the designated start city
   // (index 0, the glowing/highlighted city). One-shot, computed instantly on
-  // the main thread — never "runs live" the way GA/2-opt do.
+  // the main thread using plain Euclidean distance — only valid on the Flat
+  // map (see requestNNBaseline, which routes terrain-active requests to the
+  // worker instead so the units match the terrain-aware GA/2-opt costs).
   function nearestNeighborTourMain() {
     const n = state.cities.length;
     const visited = new Array(n).fill(false);
@@ -1036,6 +1529,27 @@ self.onmessage = function (e) {
     state.results.nn.distance = tourDistance(tour);
   }
 
+  // Dispatches the NN baseline computation to wherever it's cheap AND correct:
+  // the Flat map has no terrain cost, so the instant main-thread Euclidean
+  // version (above, unchanged from before terrain existed) is exact. Once
+  // terrain is active, NN needs the SAME terrain-aware cost matrix the GA/
+  // 2-opt use, which only the worker has — so it's requested there instead
+  // and applied asynchronously when 'nnResult' arrives (see handleWorkerMessage).
+  function requestNNBaseline() {
+    if (state.cities.length < 2) {
+      state.results.nn.distance = null;
+      state.results.nn.tour = null;
+      if (state.algo === 'nn') applyNNAsActive();
+      return;
+    }
+    if (!state.terrain) {
+      computeNNBaseline();
+      if (state.algo === 'nn') applyNNAsActive();
+      return;
+    }
+    if (worker) worker.postMessage({ cmd: 'computeNN' });
+  }
+
   // Makes the (already-computed) NN baseline the actively-displayed tour.
   // NN is a one-shot baseline, not a live-improving algorithm, so there is
   // no ghost/before tour and no generation counter for it.
@@ -1055,15 +1569,14 @@ self.onmessage = function (e) {
   // click, presets, Random, Reset). Every one of them ends by freezing the
   // city objects + the containing array (see freezeCities) and then either
   // terminating-and-recreating the worker (city SET changed) or, for
-  // Nearest-Neighbor, recomputing the instant baseline on the main thread.
+  // Nearest-Neighbor, recomputing the baseline.
   // =========================================================================
   function freezeCities() {
     for (let i = 0; i < state.cities.length; i++) Object.freeze(state.cities[i]);
     Object.freeze(state.cities);
   }
 
-  function handleCitiesChanged() {
-    freezeCities();
+  function resetRunState() {
     state.generation = 0;
     state.history = [];
     state.genSinceImprovement = 0;
@@ -1071,16 +1584,22 @@ self.onmessage = function (e) {
     state.initialDistance = null;
     state.bestTour = null;
     state.ghostTour = null;
+    state.pathSegments = null;
+    state.legModes = null;
     state.results.ga.distance = null;
     state.results.twoopt.distance = null;
     state.results.nn.distance = null;
     state.results.nn.tour = null;
+  }
+
+  function handleCitiesChanged() {
+    freezeCities();
+    resetRunState();
 
     if (state.cities.length >= 2) {
       buildDistanceMatrix();
-      computeNNBaseline();
       spawnWorker();
-      if (state.algo === 'nn') applyNNAsActive();
+      requestNNBaseline();
     } else {
       state.distMatrix = null;
       state.n = state.cities.length;
@@ -1170,9 +1689,226 @@ self.onmessage = function (e) {
   }
 
   // =========================================================================
+  // Terrain generation (main thread — cheap relative to the Dijkstra work,
+  // and it needs canvas dimensions + feeds the rendering cache anyway).
+  //
+  // Elevation/moisture come from a hand-rolled smoothed value-noise fbm (no
+  // libraries): a seeded integer hash gives each lattice point a stable
+  // pseudo-random value, bilinear + quintic-smoothed interpolation fills in
+  // between lattice points, and a few octaves are summed for natural-looking
+  // variation. Deterministic from `seed` alone, so the exact same map can be
+  // reproduced from a shared link.
+  // =========================================================================
+  function makeRng(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function shuffleInPlace(arr, rng) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+    return arr;
+  }
+
+  function hashLattice(ix, iy, seed) {
+    let h = (ix * 374761393 + iy * 668265263 + seed * 2147483647) | 0;
+    h = (h ^ (h >>> 13)) >>> 0;
+    h = Math.imul(h, 1274126177) >>> 0;
+    h = (h ^ (h >>> 16)) >>> 0;
+    return h / 4294967295;
+  }
+
+  function smoothstep5(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+
+  function valueNoise2D(x, y, seed) {
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const x1 = x0 + 1, y1 = y0 + 1;
+    const sx = smoothstep5(x - x0), sy = smoothstep5(y - y0);
+    const n00 = hashLattice(x0, y0, seed);
+    const n10 = hashLattice(x1, y0, seed);
+    const n01 = hashLattice(x0, y1, seed);
+    const n11 = hashLattice(x1, y1, seed);
+    const ix0 = n00 + (n10 - n00) * sx;
+    const ix1 = n01 + (n11 - n01) * sx;
+    return ix0 + (ix1 - ix0) * sy;
+  }
+
+  function fbm2D(x, y, seed, octaves, lacunarity, gain) {
+    let amp = 0.5, freq = 1, sum = 0, norm = 0;
+    for (let o = 0; o < octaves; o++) {
+      sum += amp * valueNoise2D(x * freq, y * freq, seed + o * 101);
+      norm += amp;
+      freq *= lacunarity;
+      amp *= gain;
+    }
+    return norm > 0 ? sum / norm : 0;
+  }
+
+  // Picks a terrain grid resolution that keeps total cells in a sane range
+  // (roughly 3k-18k) AND gets coarser as city count grows, since city count
+  // drives how many Dijkstra searches the worker will run per mode — see the
+  // matching TERRAIN_DIJKSTRA_CAP / TERRAIN_LINEAPPROX_CAP caps in workerSrc.
+  function pickGridResolution(cityCount, w, h) {
+    let targetCells;
+    if (cityCount <= 40) targetCells = 18000;
+    else if (cityCount <= 80) targetCells = 11000;
+    else if (cityCount <= TERRAIN_DIJKSTRA_CAP) targetCells = 6000;
+    else targetCells = 3000; // large-N falls back to line-marching in the worker anyway; a fine grid buys nothing
+    let cellSize = Math.sqrt((w * h) / targetCells);
+    cellSize = Math.max(4, Math.min(10, cellSize));
+    const cols = Math.max(20, Math.round(w / cellSize));
+    const rows = Math.max(20, Math.round(h / cellSize));
+    return { cellSize: cellSize, cols: cols, rows: rows };
+  }
+
+  function generateTerrain(seed, mapType, w, h, cityCount) {
+    if (mapType === 'flat') return null; // Flat/no-terrain: pure Euclidean, exactly the pre-terrain app
+
+    const grid = pickGridResolution(cityCount, w, h);
+    const cols = grid.cols, rows = grid.rows, cellSize = grid.cellSize;
+    const cellCount = cols * rows;
+    const elevation = new Float32Array(cellCount);
+    const moisture = new Float32Array(cellCount);
+    const cellType = new Uint8Array(cellCount);
+    const riverMask = new Uint8Array(cellCount);
+
+    // map-type tuning knobs
+    let seaLevel = 0.42, elevScale = 5.0, moistScale = 4.0, falloff = 0.55, ridge = false;
+    if (mapType === 'islands') { seaLevel = 0.56; falloff = 0.9; }
+    else if (mapType === 'river') { seaLevel = 0.38; elevScale = 3.2; falloff = 0.25; }
+    else if (mapType === 'mountains') { seaLevel = 0.30; elevScale = 6.0; ridge = true; falloff = 0.2; }
+
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const nx = col / cols, ny = row / rows;
+        let e = fbm2D(col / (cols / elevScale), row / (rows / elevScale), seed, 5, 2.0, 0.5);
+        if (ridge) e = 1 - Math.abs(e * 2 - 1); // ridged noise -> sharper mountain spines
+        // radial falloff pulls the map edges toward ocean so landmasses read
+        // as continents/islands rather than terrain running off-canvas
+        const dx = nx - 0.5, dy = ny - 0.5;
+        const rad = Math.sqrt(dx * dx + dy * dy) * 1.4142;
+        e = e - falloff * rad * rad;
+        const m = fbm2D(col / (cols / moistScale) + 91.7, row / (rows / moistScale) + 91.7, seed + 777, 4, 2.0, 0.5);
+        const idx = row * cols + col;
+        elevation[idx] = e;
+        moisture[idx] = m;
+      }
+    }
+
+    const hillsLevel = seaLevel + 0.16, mountainLevel = seaLevel + 0.30;
+    for (let idx = 0; idx < cellCount; idx++) {
+      const e = elevation[idx];
+      if (e < seaLevel) { cellType[idx] = TERRAIN_OCEAN; continue; }
+      if (e > mountainLevel) cellType[idx] = TERRAIN_MOUNTAIN;
+      else if (e > hillsLevel) cellType[idx] = TERRAIN_HILLS;
+      else if (moisture[idx] > 0.55 && e < seaLevel + 0.12) cellType[idx] = TERRAIN_FOREST;
+      else cellType[idx] = TERRAIN_PLAINS;
+    }
+
+    // coast pass: any land cell 4-adjacent to ocean becomes COAST
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const idx = row * cols + col;
+        if (cellType[idx] === TERRAIN_OCEAN) continue;
+        let nextToOcean = false;
+        if (col > 0 && cellType[idx - 1] === TERRAIN_OCEAN) nextToOcean = true;
+        if (col < cols - 1 && cellType[idx + 1] === TERRAIN_OCEAN) nextToOcean = true;
+        if (row > 0 && cellType[idx - cols] === TERRAIN_OCEAN) nextToOcean = true;
+        if (row < rows - 1 && cellType[idx + cols] === TERRAIN_OCEAN) nextToOcean = true;
+        if (nextToOcean) cellType[idx] = TERRAIN_COAST;
+      }
+    }
+
+    // rivers: steepest-descent from a handful of high cells down to the ocean
+    const riverRng = makeRng((seed ^ 0xA53F19) >>> 0);
+    const riverTarget = mapType === 'river' ? 6 : 3;
+    const peaks = [];
+    for (let idx = 0; idx < cellCount; idx++) {
+      if (cellType[idx] === TERRAIN_MOUNTAIN || cellType[idx] === TERRAIN_HILLS) peaks.push(idx);
+    }
+    shuffleInPlace(peaks, riverRng);
+    let carved = 0;
+    for (let p = 0; p < peaks.length && carved < riverTarget; p++) {
+      let idx = peaks[p];
+      if (riverMask[idx]) continue;
+      const path = [];
+      let guard = 0;
+      while (guard++ < cellCount) {
+        path.push(idx);
+        if (cellType[idx] === TERRAIN_OCEAN) break;
+        const row = (idx / cols) | 0, col = idx % cols;
+        let bestIdx = -1, bestElev = elevation[idx];
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx2 = col + dx, ny2 = row + dy;
+            if (nx2 < 0 || ny2 < 0 || nx2 >= cols || ny2 >= rows) continue;
+            const nIdx = ny2 * cols + nx2;
+            if (elevation[nIdx] < bestElev) { bestElev = elevation[nIdx]; bestIdx = nIdx; }
+          }
+        }
+        if (bestIdx === -1) break; // local minimum that isn't ocean — dead-end lake, stop carving
+        idx = bestIdx;
+      }
+      if (path.length > 3 && cellType[idx] === TERRAIN_OCEAN) {
+        for (let i = 0; i < path.length; i++) {
+          if (cellType[path[i]] !== TERRAIN_OCEAN) riverMask[path[i]] = 1;
+        }
+        carved++;
+      }
+    }
+
+    const terrain = {
+      seed: seed, mapType: mapType, cellSize: cellSize, cols: cols, rows: rows,
+      worldW: cols * cellSize, worldH: rows * cellSize,
+      elevation: elevation, moisture: moisture, cellType: cellType, riverMask: riverMask
+    };
+    Object.freeze(terrain.elevation);
+    Object.freeze(terrain.moisture);
+    Object.freeze(terrain.cellType);
+    Object.freeze(terrain.riverMask);
+    Object.freeze(terrain);
+    return terrain;
+  }
+
+  function isCityCoastal(c) {
+    const t = state.terrain;
+    if (!t) return false;
+    let col = Math.floor(c.x / t.cellSize), row = Math.floor(c.y / t.cellSize);
+    if (col < 0 || row < 0 || col >= t.cols || row >= t.rows) return false;
+    return t.cellType[row * t.cols + col] === TERRAIN_COAST;
+  }
+
+  // Regenerates the world (new seed and/or map type), re-sends it to the
+  // worker, and restarts the run — city positions are untouched, only the
+  // cost landscape underneath them changes.
+  function regenerateTerrain(seed, mapType) {
+    state.seed = seed;
+    state.mapType = mapType;
+    const w = canvas.clientWidth || 600, h = canvas.clientHeight || 400;
+    state.terrain = generateTerrain(seed, mapType, w, h, state.cities.length);
+    seedDisplay.textContent = String(seed);
+    renderTerrainCache();
+    resetRunState();
+    if (state.cities.length >= 2) {
+      if (worker) worker.postMessage({ cmd: 'setTerrain', terrain: serializeTerrainForWorker(state.terrain) });
+      else spawnWorker();
+      requestNNBaseline();
+    }
+  }
+
+  // =========================================================================
   // Share via URL: pack rounded integer city coords into a Uint16Array,
-  // base64-encode the raw bytes, store as ?c=. Compact (2 bytes per axis per
-  // city) rather than JSON.
+  // base64-encode the raw bytes, store as ?c=. Terrain seed / map type /
+  // transport mode ride along as their own compact query params so a shared
+  // link reproduces the exact same world, cities, and mode.
   // =========================================================================
   function encodeCitiesToParam(cities) {
     const n = cities.length;
@@ -1202,11 +1938,17 @@ self.onmessage = function (e) {
     }
   }
 
-  function citiesFromUrl() {
+  function paramsFromUrl() {
     const params = new URLSearchParams(location.search);
     const c = params.get('c');
-    if (!c) return null;
-    return decodeCitiesFromParam(c);
+    const seedParam = params.get('seed');
+    const seedNum = seedParam !== null ? parseInt(seedParam, 10) : NaN;
+    return {
+      cities: c ? decodeCitiesFromParam(c) : null,
+      seed: Number.isFinite(seedNum) ? (seedNum >>> 0) : null,
+      mapType: params.get('map'),
+      mode: params.get('mode')
+    };
   }
 
   function fallbackPrompt(url) {
@@ -1243,6 +1985,53 @@ self.onmessage = function (e) {
   window.addEventListener('resize', resizeAll);
 
   // =========================================================================
+  // Rendering: terrain background (cached to an offscreen low-res canvas —
+  // one pixel per grid cell — then stretched onto the map every frame via
+  // drawImage, which is dramatically cheaper than re-painting thousands of
+  // cells with fillRect on every animation frame).
+  // =========================================================================
+  const terrainCache = document.createElement('canvas');
+  const terrainCacheCtx = terrainCache.getContext('2d');
+
+  function terrainColor(type, elevation, isRiver) {
+    if (isRiver) return [70, 140, 220];
+    switch (type) {
+      case TERRAIN_OCEAN: {
+        const t = Math.max(0, Math.min(1, elevation / 0.5));
+        return [8 + t * 20, 30 + t * 50, 58 + t * 70];
+      }
+      case TERRAIN_COAST: return [199, 182, 138];
+      case TERRAIN_FOREST: return [58, 97, 64];
+      case TERRAIN_HILLS: return [128, 112, 82];
+      case TERRAIN_MOUNTAIN: {
+        const t = Math.max(0, Math.min(1, (elevation - 0.6) / 0.4));
+        return [110 + (226 - 110) * t, 104 + (222 - 104) * t, 112 + (224 - 112) * t];
+      }
+      case TERRAIN_PLAINS:
+      default: return [141, 163, 96];
+    }
+  }
+
+  function renderTerrainCache() {
+    const t = state.terrain;
+    if (!t) return;
+    terrainCache.width = t.cols;
+    terrainCache.height = t.rows;
+    const img = terrainCacheCtx.createImageData(t.cols, t.rows);
+    const cellCount = t.cols * t.rows;
+    for (let idx = 0; idx < cellCount; idx++) {
+      const isRiver = t.riverMask[idx] === 1;
+      const col = terrainColor(t.cellType[idx], t.elevation[idx], isRiver);
+      const p = idx * 4;
+      img.data[p] = col[0] | 0;
+      img.data[p + 1] = col[1] | 0;
+      img.data[p + 2] = col[2] | 0;
+      img.data[p + 3] = 255;
+    }
+    terrainCacheCtx.putImageData(img, 0, 0);
+  }
+
+  // =========================================================================
   // Rendering: main map
   // =========================================================================
   function drawGrid(w, h) {
@@ -1257,6 +2046,17 @@ self.onmessage = function (e) {
       ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(w, y + 0.5); ctx.stroke();
     }
     ctx.restore();
+  }
+
+  function drawTerrainBackground(w, h) {
+    ctx.fillStyle = '#0d1220';
+    ctx.fillRect(0, 0, w, h);
+    const t = state.terrain;
+    if (!t) return;
+    const prevSmoothing = ctx.imageSmoothingEnabled;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(terrainCache, 0, 0, t.worldW, t.worldH);
+    ctx.imageSmoothingEnabled = prevSmoothing;
   }
 
   function drawTourPath(tour, color, lineWidth, glow) {
@@ -1275,6 +2075,61 @@ self.onmessage = function (e) {
     ctx.shadowBlur = 0;
   }
 
+  // Draws the current best tour as its ACTUAL routed legs (bent around
+  // terrain) when the worker has supplied them, colored per-mode in Best
+  // mode with a small glyph at each leg's midpoint; otherwise (Flat map, or
+  // terrain-aware paths not received yet) falls back to the original
+  // straight-leg rendering.
+  function drawBestTourRoutes() {
+    const tour = state.bestTour;
+    if (!tour || tour.length < 2) return;
+
+    if (!state.terrain || !state.pathSegments) {
+      const color = (state.terrain && state.transportMode !== 'best') ? (MODE_COLORS[state.transportMode] || ACCENT) : ACCENT;
+      drawTourPath(tour, color, 2.5, true);
+      return;
+    }
+
+    const segs = state.pathSegments, modes = state.legModes || [];
+    for (let k = 0; k < segs.length; k++) {
+      const pts = segs[k];
+      if (!pts || pts.length < 2) continue;
+      const legMode = state.transportMode === 'best' ? modes[k] : state.transportMode;
+      const color = MODE_COLORS[legMode] || ACCENT;
+      ctx.beginPath();
+      for (let p = 0; p < pts.length; p++) {
+        if (p === 0) ctx.moveTo(pts[p].x, pts[p].y); else ctx.lineTo(pts[p].x, pts[p].y);
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 12;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+
+    if (state.transportMode === 'best' && tour.length <= 60) {
+      for (let k = 0; k < segs.length; k++) {
+        const pts = segs[k];
+        if (!pts || pts.length < 2) continue;
+        const glyph = MODE_GLYPHS[modes[k]];
+        if (!glyph) continue;
+        const mid = pts[Math.floor(pts.length / 2)];
+        ctx.save();
+        ctx.font = '11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = 'rgba(10,13,20,0.65)';
+        ctx.beginPath();
+        ctx.arc(mid.x, mid.y, 8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(glyph, mid.x, mid.y + 0.5);
+        ctx.restore();
+      }
+    }
+  }
+
   function drawCities() {
     for (let idx = 0; idx < state.cities.length; idx++) {
       const c = state.cities[idx];
@@ -1291,6 +2146,13 @@ self.onmessage = function (e) {
         ctx.strokeStyle = START_COLOR;
         ctx.lineWidth = 2;
         ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      if (isCityCoastal(c)) {
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(56,189,248,0.9)';
+        ctx.lineWidth = 1.5;
+        ctx.arc(c.x, c.y, isStart ? 10 : 7.5, 0, Math.PI * 2);
         ctx.stroke();
       }
     }
@@ -1315,11 +2177,18 @@ self.onmessage = function (e) {
     const w = canvas.clientWidth || 1;
     const h = canvas.clientHeight || 1;
     ctx.clearRect(0, 0, w, h);
-    drawGrid(w, h);
+
+    if (state.terrain) {
+      drawTerrainBackground(w, h);
+    } else {
+      ctx.fillStyle = '#0d1220';
+      ctx.fillRect(0, 0, w, h);
+      drawGrid(w, h);
+    }
 
     if (state.cities.length >= 2) {
       drawTourPath(state.ghostTour, GHOST_COLOR, 1, false);
-      drawTourPath(state.bestTour, ACCENT, 2.5, true);
+      drawBestTourRoutes();
     }
     drawCities();
 
@@ -1499,8 +2368,7 @@ self.onmessage = function (e) {
   shuffleBtn.addEventListener('click', function () {
     if (state.cities.length < 2) return;
     if (state.algo === 'nn') {
-      computeNNBaseline();
-      applyNNAsActive();
+      requestNNBaseline();
       return;
     }
     if (worker) worker.postMessage({ cmd: 'reset' });
@@ -1511,8 +2379,7 @@ self.onmessage = function (e) {
     if (state.algo === 'nn') {
       if (worker) worker.postMessage({ cmd: 'pause' });
       playBtn.disabled = true;
-      computeNNBaseline();
-      applyNNAsActive();
+      requestNNBaseline();
     } else {
       playBtn.disabled = false;
       if (!worker) {
@@ -1527,9 +2394,30 @@ self.onmessage = function (e) {
     }
   });
 
+  mapTypeSelect.addEventListener('change', function () {
+    const mapType = mapTypeSelect.value;
+    const seed = (mapType === 'flat') ? 0 : Math.floor(Math.random() * 1e9);
+    regenerateTerrain(seed, mapType);
+  });
+
+  regenerateBtn.addEventListener('click', function () {
+    const seed = Math.floor(Math.random() * 1e9);
+    regenerateTerrain(seed, mapTypeSelect.value);
+  });
+
+  transportModeSelect.addEventListener('change', function () {
+    state.transportMode = transportModeSelect.value;
+    resetRunState();
+    if (worker) worker.postMessage({ cmd: 'setMode', mode: state.transportMode });
+    requestNNBaseline();
+  });
+
   copyLinkBtn.addEventListener('click', function () {
     const payload = encodeCitiesToParam(state.cities);
-    const url = location.origin + location.pathname + '?c=' + encodeURIComponent(payload);
+    const url = location.origin + location.pathname + '?c=' + encodeURIComponent(payload) +
+      '&seed=' + encodeURIComponent(state.seed) +
+      '&map=' + encodeURIComponent(state.mapType) +
+      '&mode=' + encodeURIComponent(state.transportMode);
     const originalLabel = copyLinkBtn.textContent;
     function showCopied() {
       copyLinkBtn.textContent = 'Copied!';
@@ -1580,9 +2468,23 @@ self.onmessage = function (e) {
   // Boot
   // =========================================================================
   resizeAll();
-  const urlCities = citiesFromUrl();
-  if (urlCities && urlCities.length >= 1) {
-    state.cities = urlCities;
+
+  const urlParams = paramsFromUrl();
+  const bootMapType = (urlParams.mapType && MAP_TYPE_VALUES.indexOf(urlParams.mapType) !== -1) ? urlParams.mapType : 'continent';
+  const bootMode = (urlParams.mode && MODE_VALUES.indexOf(urlParams.mode) !== -1) ? urlParams.mode : 'best';
+  const bootSeed = urlParams.seed !== null ? urlParams.seed : Math.floor(Math.random() * 1e9);
+
+  mapTypeSelect.value = bootMapType;
+  transportModeSelect.value = bootMode;
+  state.mapType = bootMapType;
+  state.transportMode = bootMode;
+  state.seed = bootSeed;
+  state.terrain = generateTerrain(bootSeed, bootMapType, canvas.clientWidth || 600, canvas.clientHeight || 400, urlParams.cities ? urlParams.cities.length : 0);
+  seedDisplay.textContent = String(bootSeed);
+  renderTerrainCache();
+
+  if (urlParams.cities && urlParams.cities.length >= 1) {
+    state.cities = urlParams.cities;
     handleCitiesChanged();
     hideInstructions();
   } else {
