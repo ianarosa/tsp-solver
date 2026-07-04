@@ -1961,6 +1961,66 @@ self.onmessage = function (e) {
     return t.cellType[idx] === TERRAIN_OCEAN || t.riverMask[idx] === 1;
   }
 
+  // When terrain is (re)generated under EXISTING cities, a city that used to
+  // sit on land can end up underwater. This scans every city and, for any now
+  // on water (ocean or river), relocates it to the CENTER of the nearest land
+  // cell via a deterministic outward ring search (increasing Chebyshev radius,
+  // fixed neighbor scan order — no randomness). Land = coast/plains/forest/
+  // hills/mountain (anything isWaterAtPoint reports false for). If terrain is
+  // null (flat map) or no land exists at all, nothing moves. Moved cities are
+  // rebuilt into a fresh array routed through applyCities so they re-freeze and
+  // the cost matrix recomputes — exactly like any other city-set change.
+  function relocateStrandedCities() {
+    const t = state.terrain;
+    if (!t) return;
+    const cols = t.cols, rows = t.rows, cellSize = t.cellSize;
+    const w = canvas.clientWidth || t.worldW || 600;
+    const h = canvas.clientHeight || t.worldH || 400;
+
+    function isLandCell(col, row) {
+      if (col < 0 || row < 0 || col >= cols || row >= rows) return false;
+      const idx = row * cols + col;
+      return t.cellType[idx] !== TERRAIN_OCEAN && t.riverMask[idx] !== 1;
+    }
+
+    function nearestLandCenter(x, y) {
+      let col = Math.floor(x / cellSize), row = Math.floor(y / cellSize);
+      if (col < 0) col = 0; else if (col >= cols) col = cols - 1;
+      if (row < 0) row = 0; else if (row >= rows) row = rows - 1;
+      const maxR = Math.max(cols, rows);
+      for (let r = 1; r <= maxR; r++) {
+        // Scan the square ring at Chebyshev radius r in a fixed order: top &
+        // bottom edges left-to-right, then left & right edges top-to-bottom.
+        for (let cc = col - r; cc <= col + r; cc++) {
+          if (isLandCell(cc, row - r)) return cellCenter(cc, row - r);
+          if (isLandCell(cc, row + r)) return cellCenter(cc, row + r);
+        }
+        for (let rr = row - r + 1; rr <= row + r - 1; rr++) {
+          if (isLandCell(col - r, rr)) return cellCenter(col - r, rr);
+          if (isLandCell(col + r, rr)) return cellCenter(col + r, rr);
+        }
+      }
+      return null; // no land anywhere
+    }
+
+    function cellCenter(col, row) {
+      let x = (col + 0.5) * cellSize, y = (row + 0.5) * cellSize;
+      if (x < 0) x = 0; else if (x > w) x = w;
+      if (y < 0) y = 0; else if (y > h) y = h;
+      return { x: x, y: y };
+    }
+
+    let changed = false;
+    const moved = state.cities.map(function (c) {
+      if (!isWaterAtPoint(c.x, c.y)) return { x: c.x, y: c.y };
+      const dest = nearestLandCenter(c.x, c.y);
+      if (!dest) return { x: c.x, y: c.y };
+      changed = true;
+      return dest;
+    });
+    if (changed) applyCities(moved);
+  }
+
   // Regenerates the world (new seed and/or map type), re-sends it to the
   // worker, and restarts the run — city positions are untouched, only the
   // cost landscape underneath them changes.
@@ -1971,6 +2031,14 @@ self.onmessage = function (e) {
     state.terrain = generateTerrain(seed, mapType, w, h, state.cities.length);
     seedDisplay.textContent = String(seed);
     renderTerrainCache();
+    // Rescue any city the new terrain stranded on water BEFORE restarting the
+    // run, so the worker is initialized with the corrected positions. When a
+    // relocation happens, applyCities() (called inside relocateStrandedCities)
+    // swaps state.cities for a fresh array and itself rebuilds the worker +
+    // baseline, so we skip the redundant restart below in that case.
+    const citiesRef = state.cities;
+    relocateStrandedCities();
+    if (state.cities !== citiesRef) return; // applyCities already restarted everything
     resetRunState();
     if (state.cities.length >= 2) {
       if (worker) worker.postMessage({ cmd: 'setTerrain', terrain: serializeTerrainForWorker(state.terrain) });
@@ -2610,6 +2678,12 @@ self.onmessage = function (e) {
     state.cities = urlParams.cities;
     handleCitiesChanged();
     hideInstructions();
+    // A shared link's cities were placed against whatever map existed when the
+    // link was made; if this boot map strands any on water, rescue them onto
+    // the nearest land (relocateStrandedCities re-routes through applyCities,
+    // which re-freezes and rebuilds the worker). No-op for freshly clicked
+    // cities, which were already blocked from water at click time.
+    relocateStrandedCities();
   } else {
     handleCitiesChanged();
   }
