@@ -1948,6 +1948,19 @@ self.onmessage = function (e) {
     return t.cellType[row * t.cols + col] === TERRAIN_COAST;
   }
 
+  // "Water" = ocean cells OR river cells — the only terrain a city may NOT be
+  // placed on. Coast and all other land (plains/forest/hills/mountain) are
+  // valid. On the Flat map (state.terrain === null) there is no water at all,
+  // so this always returns false there and callers fall back to old behavior.
+  function isWaterAtPoint(x, y) {
+    const t = state.terrain;
+    if (!t) return false;
+    let col = Math.floor(x / t.cellSize), row = Math.floor(y / t.cellSize);
+    if (col < 0 || row < 0 || col >= t.cols || row >= t.rows) return false;
+    const idx = row * t.cols + col;
+    return t.cellType[idx] === TERRAIN_OCEAN || t.riverMask[idx] === 1;
+  }
+
   // Regenerates the world (new seed and/or map type), re-sends it to the
   // worker, and restarts the run — city positions are untouched, only the
   // cost landscape underneath them changes.
@@ -2091,6 +2104,37 @@ self.onmessage = function (e) {
       img.data[p + 3] = 255;
     }
     terrainCacheCtx.putImageData(img, 0, 0);
+  }
+
+  // =========================================================================
+  // Rejected-click pulses: a subtle, self-fading visual cue drawn at a click
+  // point that was rejected for landing on water. Purely a render-loop
+  // transient — not part of the cities/terrain immutability contract, so it
+  // lives as a plain mutable array rather than on `state`.
+  // =========================================================================
+  const REJECTED_PULSE_DURATION = 450; // ms
+  const rejectedPulses = []; // { x, y, t0 } — t0 from performance.now()
+
+  function spawnRejectedPulse(x, y) {
+    rejectedPulses.push({ x: x, y: y, t0: performance.now() });
+  }
+
+  function drawRejectedPulses() {
+    if (rejectedPulses.length === 0) return;
+    const now = performance.now();
+    for (let i = rejectedPulses.length - 1; i >= 0; i--) {
+      const p = rejectedPulses[i];
+      const elapsed = now - p.t0;
+      if (elapsed >= REJECTED_PULSE_DURATION) { rejectedPulses.splice(i, 1); continue; }
+      const t = elapsed / REJECTED_PULSE_DURATION;
+      const radius = 6 + t * 20;
+      const alpha = 0.5 * (1 - t);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255,107,107,' + alpha.toFixed(3) + ')'; // var(--danger)
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
   }
 
   // =========================================================================
@@ -2253,6 +2297,7 @@ self.onmessage = function (e) {
       drawBestTourRoutes();
     }
     drawCities();
+    drawRejectedPulses();
 
     if (state.cities.length === 0) {
       drawCenteredText('Click anywhere to drop your first city', w, h);
@@ -2361,6 +2406,10 @@ self.onmessage = function (e) {
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+    if (isWaterAtPoint(x, y)) {
+      spawnRejectedPulse(x, y);
+      return;
+    }
     applyCities(state.cities.slice().concat([{ x: x, y: y }]));
   });
 
@@ -2392,19 +2441,31 @@ self.onmessage = function (e) {
     const usableH = Math.max(1, h - margin * 2);
 
     const newCities = state.cities.slice();
+    // On a terrain map, only land is a valid drop site: sample-and-retry (up
+    // to 40 attempts) rejecting both water and too-close-to-existing-city
+    // spots, and skip the city entirely if no land was found in time (fine on
+    // a mostly-ocean map). On the Flat map (no terrain) this is unchanged
+    // from before: 5 spacing-only attempts, city placed regardless of outcome.
     for (let i = 0; i < count; i++) {
       let x, y, tries = 0, ok = false;
-      while (!ok && tries < 5) {
+      const maxTries = state.terrain ? 40 : 5;
+      while (!ok && tries < maxTries) {
         x = margin + Math.random() * usableW;
         y = margin + Math.random() * usableH;
-        ok = true;
-        for (let k = 0; k < newCities.length; k++) {
-          const c = newCities[k];
-          if (Math.abs(c.x - x) < 4 && Math.abs(c.y - y) < 4) { ok = false; break; }
+        ok = !(state.terrain && isWaterAtPoint(x, y));
+        if (ok) {
+          for (let k = 0; k < newCities.length; k++) {
+            const c = newCities[k];
+            if (Math.abs(c.x - x) < 4 && Math.abs(c.y - y) < 4) { ok = false; break; }
+          }
         }
         tries++;
       }
-      newCities.push({ x: x, y: y });
+      if (state.terrain) {
+        if (ok) newCities.push({ x: x, y: y });
+      } else {
+        newCities.push({ x: x, y: y });
+      }
     }
     applyCities(newCities);
   });
