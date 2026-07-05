@@ -550,7 +550,11 @@
   // DOM references
   // =========================================================================
   const canvas = document.getElementById('mapCanvas');
-  const ctx = canvas.getContext('2d');
+  // `ctx` is `let` (not `const`) so renderRouteLayer() can transiently repoint
+  // it at the offscreen route-layer context while the (ctx-based) tour/port/
+  // city draw helpers paint into that cache, then restore it to the visible
+  // canvas. Every other frame it points at the on-screen canvas as before.
+  let ctx = canvas.getContext('2d');
   const mapWrap = document.getElementById('mapWrap');
   const instructions = document.getElementById('instructions');
 
@@ -684,7 +688,10 @@
     pathSegments: null,     // array of per-leg point arrays for the CURRENT best tour, as reported by the worker (terrain-aware routing only)
     legModes: null,         // parallel array of winning-mode strings per leg (only meaningful in 'best' mode)
     connectors: null,       // parallel to pathSegments: per boat leg, { a, b } routed over-land connector polylines ({mode,pts}) or null for non-boat legs
-    ports: null             // per-city { x, y, cell, dock } port (nearest water cell) or null if landlocked; main-thread render-only copy, recomputed when cities/terrain change. NOT stored on the frozen city objects (immutability).
+    ports: null,            // per-city { x, y, cell, dock } port (nearest water cell) or null if landlocked; main-thread render-only copy, recomputed when cities/terrain change. NOT stored on the frozen city objects (immutability).
+
+    // ---- render caching (perf) ----
+    routeLayerDirty: true   // when true, the offscreen route layer (best tour + routed multimodal paths + ports + city glyphs) is re-rendered on the next frame; otherwise animate() just blits the cached layer. Set true wherever the tour, cities, terrain, transport mode, ports, or canvas size change (mirrors the terrain cache's invalidation, but flag-driven so the rAF loop consumes it). See renderRouteLayer().
   };
 
   // =========================================================================
@@ -1726,6 +1733,7 @@ self.onmessage = function (e) {
         state.pathSegments = msg.pathSegments || null;
         state.legModes = msg.legModes || null;
         state.connectors = msg.connectors || null;
+        state.routeLayerDirty = true; // new routed tour to draw
       }
       return;
     }
@@ -1750,6 +1758,10 @@ self.onmessage = function (e) {
         state.legModes = msg.legModes;
         state.connectors = msg.connectors || null;
       }
+      // A new/improved best tour arrived — invalidate the cached route layer so
+      // this frame re-renders it (this is the "watch it untangle" animation:
+      // one cache repaint per improvement, not one per frame).
+      state.routeLayerDirty = true;
     }
   }
 
@@ -1872,6 +1884,7 @@ self.onmessage = function (e) {
     state.generation = 0;
     state.history = nn.distance != null ? [nn.distance] : [];
     state.genSinceImprovement = 0;
+    state.routeLayerDirty = true; // NN tour became the active tour
   }
 
   // =========================================================================
@@ -1901,6 +1914,7 @@ self.onmessage = function (e) {
     state.results.twoopt.distance = null;
     state.results.nn.distance = null;
     state.results.nn.tour = null;
+    state.routeLayerDirty = true; // tour cleared — route layer must repaint (empty)
   }
 
   function handleCitiesChanged() {
@@ -2220,6 +2234,7 @@ self.onmessage = function (e) {
   // immutability contract is preserved. Recomputed whenever cities or terrain
   // change (see handleCitiesChanged / regenerateTerrain). Null on the flat map.
   function computePorts() {
+    state.routeLayerDirty = true; // port markers are part of the cached route layer
     const t = state.terrain;
     if (!t) { state.ports = null; return; }
     const cols = t.cols, rows = t.rows, cellSize = t.cellSize;
@@ -2413,6 +2428,9 @@ self.onmessage = function (e) {
   function resizeAll() {
     fitCanvasToContainer(canvas);
     fitCanvasToContainer(chartCanvas);
+    // The canvas backing store changed size — the cached route layer must be
+    // resized (in sizeRouteLayer) and repainted to match.
+    state.routeLayerDirty = true;
   }
 
   if (window.ResizeObserver) {
@@ -2429,6 +2447,54 @@ self.onmessage = function (e) {
   // =========================================================================
   const terrainCache = document.createElement('canvas');
   const terrainCacheCtx = terrainCache.getContext('2d');
+
+  // =========================================================================
+  // Rendering: route layer (cached to a second offscreen canvas, same pattern
+  // as the terrain cache above). The best tour, its routed multimodal path
+  // segments, port markers and per-city glyphs are STABLE between worker
+  // messages — they only change when a better tour arrives, cities/terrain
+  // change, the transport mode switches, or the canvas resizes. Re-painting
+  // all of that every rAF is what made large city counts crawl, so instead we
+  // render it ONCE into this layer whenever state.routeLayerDirty is set, and
+  // just blit the layer each frame (see render()). Live transients — rejected-
+  // click pulses, the "add more cities" hint — stay on the visible canvas.
+  // =========================================================================
+  const routeLayer = document.createElement('canvas');
+  const routeLayerCtx = routeLayer.getContext('2d');
+
+  // Size the offscreen route layer to match the visible canvas's device-pixel
+  // backing store and DPR transform, so the (CSS-pixel) city/tour coordinates
+  // land identically in both. fitCanvasToContainer() can't be reused here
+  // because a detached offscreen canvas has no layout box to measure.
+  function sizeRouteLayer() {
+    const dpr = window.devicePixelRatio || 1;
+    if (routeLayer.width !== canvas.width) routeLayer.width = canvas.width;
+    if (routeLayer.height !== canvas.height) routeLayer.height = canvas.height;
+    routeLayerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // Repaint the whole route layer from scratch. Temporarily repoints `ctx` at
+  // the offscreen context so the existing draw helpers (drawTourPath /
+  // drawBestTourRoutes / drawPorts / drawCities) paint into the cache
+  // unchanged, then restores it. Consumes the dirty flag.
+  function renderRouteLayer() {
+    sizeRouteLayer();
+    const w = canvas.clientWidth || 1;
+    const h = canvas.clientHeight || 1;
+    routeLayerCtx.clearRect(0, 0, w, h);
+    const prevCtx = ctx;
+    ctx = routeLayerCtx;
+    if (state.cities.length >= 2) {
+      // Ghost of the initial messy tour — straight segments, flat map only
+      // (see the note in render(); on terrain maps it just clutters).
+      if (!state.terrain) drawTourPath(state.ghostTour, GHOST_COLOR, 1, false);
+      drawBestTourRoutes();
+    }
+    drawPorts();
+    drawCities();
+    ctx = prevCtx;
+    state.routeLayerDirty = false;
+  }
 
   function terrainColor(type, elevation, isRiver) {
     if (isRiver) return [70, 140, 220];
@@ -2466,6 +2532,9 @@ self.onmessage = function (e) {
       img.data[p + 3] = 255;
     }
     terrainCacheCtx.putImageData(img, 0, 0);
+    // The route layer draws terrain-dependent details (coastal city rings,
+    // port positions), so a terrain change invalidates it too.
+    state.routeLayerDirty = true;
   }
 
   // =========================================================================
@@ -2728,17 +2797,16 @@ self.onmessage = function (e) {
       drawGrid(w, h);
     }
 
-    if (state.cities.length >= 2) {
-      // The faint "ghost" of the initial messy tour is drawn as STRAIGHT city-
-      // to-city segments — meaningful only on the flat map. On terrain maps
-      // those straight lines cut dead-straight across ocean and over mountains,
-      // ignoring the routed paths and cluttering the map, so suppress the ghost
-      // there entirely and only show the bright routed best tour.
-      if (!state.terrain) drawTourPath(state.ghostTour, GHOST_COLOR, 1, false);
-      drawBestTourRoutes();
-    }
-    drawPorts();
-    drawCities();
+    // Best tour + routed multimodal paths + ports + city glyphs live on the
+    // cached route layer (see renderRouteLayer). Re-render it only when it's
+    // gone stale (a better tour arrived, cities/terrain/mode/size changed),
+    // then blit it — this is what keeps large city counts at ~60fps instead of
+    // re-stroking every leg every frame. The ghost tour and the "watch it
+    // untangle" improvements both re-render the layer on the frames they land.
+    if (state.routeLayerDirty) renderRouteLayer();
+    ctx.drawImage(routeLayer, 0, 0, w, h);
+
+    // Live per-frame transients stay on the visible canvas.
     drawRejectedPulses();
 
     if (state.cities.length === 0) {
