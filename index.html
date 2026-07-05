@@ -535,6 +535,16 @@
   .panel::-webkit-scrollbar{ width:8px; }
   .panel::-webkit-scrollbar-thumb{ background:#2a324a; border-radius:8px; }
   .panel::-webkit-scrollbar-track{ background:transparent; }
+
+  /* ---------- Real-place comparison mode ---------- */
+  /* When comparing against a real region the terrain sandbox is meaningless,
+     so its controls and overlays are hidden; the twin-panel view is drawn by
+     renderComparison() straight onto the main canvas. */
+  body.compare-mode #citiesSection,
+  body.compare-mode #terrainControls,
+  body.compare-mode #terrainLegendSection,
+  body.compare-mode #mapLegend,
+  body.compare-mode #resetViewBtn{ display:none !important; }
 </style>
 </head>
 <body>
@@ -588,7 +598,7 @@
         </div>
       </div>
 
-      <div class="section">
+      <div class="section" id="citiesSection">
         <h2>Cities</h2>
         <div class="row-inline">
           <button id="randomBtn" aria-label="Add random cities">Add Random Cities</button>
@@ -614,6 +624,17 @@
       <div class="section">
         <h2>World</h2>
         <label class="field">
+          <div class="field-head"><span>Real place</span></div>
+          <select id="realPlaceSelect" aria-label="Compare with a real-world region and its transport network">
+            <option value="" selected>— none (sandbox) —</option>
+            <option value="japan">Japan — Shinkansen</option>
+            <option value="europe">Europe — capitals &amp; rail</option>
+            <option value="usa">USA — metros &amp; interstates</option>
+          </select>
+        </label>
+        <div class="hint" id="realPlaceHint">Pick a region to compare the AI's optimized loop (left) against the real transport network (right).</div>
+        <div id="terrainControls">
+        <label class="field">
           <div class="field-head"><span>Map type</span></div>
           <select id="mapTypeSelect" aria-label="Map / terrain type">
             <option value="continent" selected>Continent</option>
@@ -638,6 +659,7 @@
           </select>
         </label>
         <div class="hint">Tour cost now respects terrain: routes bend around mountains, hug coasts and rivers, and (in Best mode) pick the cheapest transport per leg.</div>
+        </div>
       </div>
 
       <div class="section">
@@ -713,7 +735,7 @@
         </div>
       </div>
 
-      <div class="section">
+      <div class="section" id="terrainLegendSection">
         <h2>Legend</h2>
         <div class="legend-grid">
           <span class="legend-chip"><i style="background:#8da360;"></i>Plains</span>
@@ -778,6 +800,8 @@
   const regenerateBtn = document.getElementById('regenerateBtn');
   const seedDisplay = document.getElementById('seedDisplay');
   const transportModeSelect = document.getElementById('transportModeSelect');
+  const realPlaceSelect = document.getElementById('realPlaceSelect');
+  const realPlaceHint = document.getElementById('realPlaceHint');
 
   const speedSlider = document.getElementById('speedSlider');
   const speedValue = document.getElementById('speedValue');
@@ -811,6 +835,107 @@
   const MODE_VALUES = ['best', 'highway', 'train', 'boat', 'plane'];
   const MODE_COLORS = { highway: '#f5a623', train: '#9b6bff', boat: '#38bdf8', plane: '#ff6b9d' };
   const MODE_GLYPHS = { highway: '🚗', train: '🚆', boat: '⛴', plane: '✈' };
+
+  // =========================================================================
+  // Real-place comparison datasets (baked in, OFFLINE — no fetch/API). Each
+  // region = a list of real {name, lat, lon} cities and a list of real
+  // transport-network edges [i, j] (indices into that city list). Coordinates
+  // are real-world lat/lon; edges are the actual well-known lines/corridors
+  // between adjacent cities (a recognizable skeleton, not exhaustive). Used by
+  // the twin-panel comparison mode: the LEFT panel evolves an AI TSP loop over
+  // these points; the RIGHT panel draws these real edges. Same projection for
+  // both, so the city dots line up between panels.
+  // =========================================================================
+  const REAL_REGIONS = {
+    japan: {
+      label: 'Japan — Shinkansen',
+      netLabel: 'Shinkansen network',
+      cities: [
+        { name: 'Tokyo',     lat: 35.68, lon: 139.77 }, // 0
+        { name: 'Yokohama',  lat: 35.47, lon: 139.62 }, // 1  (Shin-Yokohama)
+        { name: 'Nagoya',    lat: 35.17, lon: 136.88 }, // 2
+        { name: 'Kyoto',     lat: 34.99, lon: 135.76 }, // 3
+        { name: 'Osaka',     lat: 34.73, lon: 135.50 }, // 4  (Shin-Osaka)
+        { name: 'Kobe',      lat: 34.69, lon: 135.20 }, // 5  (Shin-Kobe)
+        { name: 'Okayama',   lat: 34.67, lon: 133.92 }, // 6
+        { name: 'Hiroshima', lat: 34.40, lon: 132.46 }, // 7
+        { name: 'Hakata',    lat: 33.59, lon: 130.42 }, // 8  (Fukuoka)
+        { name: 'Sendai',    lat: 38.26, lon: 140.88 }, // 9
+        { name: 'Morioka',   lat: 39.70, lon: 141.15 }, // 10
+        { name: 'Aomori',    lat: 40.83, lon: 140.69 }, // 11 (Shin-Aomori)
+        { name: 'Niigata',   lat: 37.91, lon: 139.06 }, // 12
+        { name: 'Nagano',    lat: 36.65, lon: 138.19 }, // 13
+        { name: 'Toyama',    lat: 36.70, lon: 137.21 }, // 14
+        { name: 'Kanazawa',  lat: 36.58, lon: 136.65 }  // 15
+      ],
+      // Tokaido/Sanyo spine + Tohoku + Joetsu + Hokuriku lines
+      edges: [
+        [0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7],[7,8], // Tokaido + Sanyo (Tokyo->Hakata)
+        [0,9],[9,10],[10,11],                             // Tohoku (Tokyo->Aomori)
+        [0,12],                                           // Joetsu (Tokyo->Niigata)
+        [0,13],[13,14],[14,15]                            // Hokuriku (Tokyo->Kanazawa)
+      ]
+    },
+    europe: {
+      label: 'Europe — capitals & rail',
+      netLabel: 'high-speed rail corridors',
+      cities: [
+        { name: 'London',     lat: 51.51, lon: -0.13 }, // 0
+        { name: 'Paris',      lat: 48.85, lon:  2.35 }, // 1
+        { name: 'Brussels',   lat: 50.85, lon:  4.35 }, // 2
+        { name: 'Amsterdam',  lat: 52.37, lon:  4.90 }, // 3
+        { name: 'Berlin',     lat: 52.52, lon: 13.40 }, // 4
+        { name: 'Madrid',     lat: 40.42, lon: -3.70 }, // 5
+        { name: 'Lisbon',     lat: 38.72, lon: -9.14 }, // 6
+        { name: 'Rome',       lat: 41.90, lon: 12.50 }, // 7
+        { name: 'Vienna',     lat: 48.21, lon: 16.37 }, // 8
+        { name: 'Prague',     lat: 50.08, lon: 14.44 }, // 9
+        { name: 'Warsaw',     lat: 52.23, lon: 21.01 }, // 10
+        { name: 'Copenhagen', lat: 55.68, lon: 12.57 }, // 11
+        { name: 'Bern',       lat: 46.95, lon:  7.45 }, // 12
+        { name: 'Budapest',   lat: 47.50, lon: 19.04 }  // 13
+      ],
+      edges: [
+        [0,1],[0,2],[1,2],   // London–Paris–Brussels (Eurostar/Thalys)
+        [2,3],[3,4],         // Brussels–Amsterdam–Berlin
+        [1,12],[12,7],       // Paris–Bern–Rome (via the Alps)
+        [1,5],[5,6],         // Paris–Madrid–Lisbon
+        [4,9],[9,8],[8,13],  // Berlin–Prague–Vienna–Budapest
+        [9,10],[4,10],       // Prague–Warsaw, Berlin–Warsaw
+        [4,11]               // Berlin–Copenhagen
+      ]
+    },
+    usa: {
+      label: 'USA — metros & interstates',
+      netLabel: 'interstate corridors',
+      cities: [
+        { name: 'New York',    lat: 40.71, lon:  -74.01 }, // 0
+        { name: 'Boston',      lat: 42.36, lon:  -71.06 }, // 1
+        { name: 'Philadelphia',lat: 39.95, lon:  -75.17 }, // 2
+        { name: 'Washington',  lat: 38.90, lon:  -77.04 }, // 3
+        { name: 'Chicago',     lat: 41.88, lon:  -87.63 }, // 4
+        { name: 'Atlanta',     lat: 33.75, lon:  -84.39 }, // 5
+        { name: 'Miami',       lat: 25.76, lon:  -80.19 }, // 6
+        { name: 'Houston',     lat: 29.76, lon:  -95.37 }, // 7
+        { name: 'Dallas',      lat: 32.78, lon:  -96.80 }, // 8
+        { name: 'Denver',      lat: 39.74, lon: -104.99 }, // 9
+        { name: 'Phoenix',     lat: 33.45, lon: -112.07 }, // 10
+        { name: 'Los Angeles', lat: 34.05, lon: -118.24 }, // 11
+        { name: 'San Francisco',lat: 37.77, lon: -122.42 },// 12
+        { name: 'Seattle',     lat: 47.61, lon: -122.33 }, // 13
+        { name: 'Minneapolis', lat: 44.98, lon:  -93.27 }  // 14
+      ],
+      edges: [
+        [0,1],[0,2],[2,3],   // I-95 NE: Boston–NY–Philadelphia–Washington
+        [3,5],[5,6],         // I-85/I-95: Washington–Atlanta–Miami
+        [5,8],[8,7],         // I-20/I-45: Atlanta–Dallas–Houston
+        [0,4],[4,14],[14,13],// I-80/I-94/I-90: NY–Chicago–Minneapolis–Seattle
+        [4,9],[9,10],        // I-80/I-25: Chicago–Denver–Phoenix
+        [7,10],[10,11],      // I-10: Houston–Phoenix–Los Angeles
+        [11,12],[12,13]      // I-5: LA–San Francisco–Seattle
+      ]
+    }
+  };
 
   // City-count performance ceilings for terrain-aware costing, mirrored in
   // the worker (see the matching constants + comment inside workerSrc). Only
@@ -895,6 +1020,13 @@
     legModes: null,         // parallel array of winning-mode strings per leg (only meaningful in 'best' mode)
     connectors: null,       // parallel to pathSegments: per boat leg, { a, b } routed over-land connector polylines ({mode,pts}) or null for non-boat legs
     ports: null,            // per-city { x, y, cell, dock } port (nearest water cell) or null if landlocked; main-thread render-only copy, recomputed when cities/terrain change. NOT stored on the frozen city objects (immutability).
+
+    // ---- real-place comparison mode (new) ----
+    compareRegion: null,    // null in the terrain sandbox; a REAL_REGIONS key ('japan'|'europe'|'usa') while comparing. When set, render() draws the twin-panel view instead of terrain, terrain is null, and the solver runs over plain Euclidean distances between the region's projected real cities.
+    compareLayout: null,    // { stacked, a:{x,y,w,h}, b:{x,y,w,h}, w, h } — current twin-panel geometry (a = AI/left, b = real/right)
+    realPts: null,          // per-city panel-local {x,y} from projectRegionToPanel — added to a panel origin to draw either panel (keeps dots aligned across both)
+    realEdges: null,        // baked real-network edges [i,j] for the active region (RIGHT panel)
+    realNames: null,        // per-city display names for the active region (labels)
 
     // ---- render caching (perf) ----
     routeLayerDirty: true   // when true, the offscreen route layer (best tour + routed multimodal paths + ports + city glyphs) is re-rendered on the next frame; otherwise animate() just blits the cached layer. Set true wherever the tour, cities, terrain, transport mode, ports, or canvas size change (mirrors the terrain cache's invalidation, but flag-driven so the rAF loop consumes it). See renderRouteLayer().
@@ -2864,6 +2996,18 @@ self.onmessage = function (e) {
   function resizeAll() {
     fitCanvasToContainer(canvas);
     fitCanvasToContainer(chartCanvas);
+    // In comparison mode the twin-panel geometry depends on the viewport; if it
+    // actually changed (incl. the desktop<->stacked switch), reproject the
+    // region into the new panels. The terrain-cache path below doesn't apply.
+    if (state.compareRegion) {
+      const prev = state.compareLayout;
+      const next = computeCompareLayout();
+      if (!prev || prev.stacked !== next.stacked ||
+          Math.abs(prev.a.w - next.a.w) > 2 || Math.abs(prev.a.h - next.a.h) > 2) {
+        layoutCompareCities();
+      }
+      return;
+    }
     // The viewport changed size, so pan clamps (which depend on w/h) may now be
     // violated — re-clamp and refresh the reset-view affordance.
     clampView();
@@ -3401,7 +3545,246 @@ self.onmessage = function (e) {
     ctx.restore();
   }
 
+  // =========================================================================
+  // Real-place comparison mode: twin-panel view. Drawn straight onto the
+  // visible canvas each frame (no view transform, no terrain/route caches —
+  // it's ~15 cities, trivially 60fps). LEFT panel = the AI's evolving TSP loop
+  // over the region's projected real cities; RIGHT panel = the region's baked
+  // real transport network. Same projection for both, so dots line up.
+  // =========================================================================
+
+  // Equirectangular projection with a cos(mean latitude) longitude correction
+  // (so east–west isn't stretched at higher latitudes), auto-fit into a
+  // panel of size pw×ph with `pad` px of padding, north up. Returns
+  // panel-local {x,y}; identical output feeds both panels.
+  function projectRegionToPanel(cities, pw, ph, pad) {
+    const meanLat = cities.reduce(function (s, c) { return s + c.lat; }, 0) / cities.length;
+    const k = Math.cos(meanLat * Math.PI / 180);
+    const raw = cities.map(function (c) { return { x: c.lon * k, y: -c.lat }; }); // y negated: north up
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < raw.length; i++) {
+      const p = raw[i];
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    const spanX = Math.max(1e-6, maxX - minX), spanY = Math.max(1e-6, maxY - minY);
+    const availW = Math.max(1, pw - pad * 2), availH = Math.max(1, ph - pad * 2);
+    const scale = Math.min(availW / spanX, availH / spanY);
+    const offX = pad + (availW - spanX * scale) / 2;
+    const offY = pad + (availH - spanY * scale) / 2;
+    return raw.map(function (p) {
+      return { x: offX + (p.x - minX) * scale, y: offY + (p.y - minY) * scale };
+    });
+  }
+
+  // Twin-panel geometry: side-by-side on a roomy canvas, stacked vertically on
+  // a narrow (mobile) one so both panels stay fully visible.
+  function computeCompareLayout() {
+    const w = canvas.clientWidth || 600, h = canvas.clientHeight || 400;
+    const gap = 10;
+    const stacked = w < 620;
+    let a, b;
+    if (stacked) {
+      const ph = (h - gap) / 2;
+      a = { x: 0, y: 0, w: w, h: ph };           // AI (top)
+      b = { x: 0, y: ph + gap, w: w, h: ph };    // Real (bottom)
+    } else {
+      const pw = (w - gap) / 2;
+      a = { x: 0, y: 0, w: pw, h: h };           // AI (left)
+      b = { x: pw + gap, y: 0, w: pw, h: h };    // Real (right)
+    }
+    return { stacked: stacked, a: a, b: b, w: w, h: h };
+  }
+
+  // Reproject the active region into the current panel geometry and feed the
+  // AI-panel cities (projected pixel coords, frozen) to the solver via
+  // applyCities — which spawns a worker with terrain=null, i.e. plain
+  // Euclidean distances between the real cities (straight, terrain-free legs).
+  function layoutCompareCities() {
+    if (!state.compareRegion) return;
+    const region = REAL_REGIONS[state.compareRegion];
+    const layout = computeCompareLayout();
+    state.compareLayout = layout;
+    const pad = Math.max(30, Math.min(layout.a.w, layout.a.h) * 0.11);
+    const pts = projectRegionToPanel(region.cities, layout.a.w, layout.a.h, pad);
+    state.realPts = pts;
+    state.realEdges = region.edges;
+    state.realNames = region.cities.map(function (c) { return c.name; });
+    // AI-panel cities = panel-local pts translated to the AI panel's origin.
+    const leftCities = pts.map(function (p) { return { x: layout.a.x + p.x, y: layout.a.y + p.y }; });
+    applyCities(leftCities); // freezes, rebuilds worker (terrain=null => Euclidean cost)
+  }
+
+  let sandboxSnapshot = null; // saved terrain-sandbox state while a region comparison is active
+
+  function enterCompareMode(key) {
+    const region = REAL_REGIONS[key];
+    if (!region) return;
+    if (!state.compareRegion) {
+      // Entering from the sandbox — snapshot everything needed to restore it.
+      sandboxSnapshot = {
+        cities: state.cities,
+        terrain: state.terrain,
+        mapType: state.mapType,
+        seed: state.seed,
+        transportMode: state.transportMode
+      };
+    }
+    state.compareRegion = key;
+    document.body.classList.add('compare-mode');
+    state.terrain = null;      // comparison uses plain Euclidean cost over projected points
+    state.running = false;
+    updatePlayButton();
+    resetView();               // identity view (comparison ignores the zoom/pan transform)
+    hideInstructions();
+    layoutCompareCities();     // projects + applyCities (spawns worker)
+    realPlaceHint.textContent = 'Left: the AI’s optimized loop. Right: the real ' + region.netLabel + '. Press Play or ⚡ Instant Solve to watch the AI untangle.';
+  }
+
+  function exitCompareMode() {
+    if (!state.compareRegion) return;
+    const snap = sandboxSnapshot;
+    sandboxSnapshot = null;
+    state.compareRegion = null;
+    state.compareLayout = null;
+    state.realPts = null;
+    state.realEdges = null;
+    state.realNames = null;
+    document.body.classList.remove('compare-mode');
+    // Restore the terrain sandbox exactly as it was before comparison.
+    if (snap) {
+      state.terrain = snap.terrain;
+      state.mapType = snap.mapType;
+      state.seed = snap.seed;
+      state.transportMode = snap.transportMode;
+      if (mapTypeSelect) mapTypeSelect.value = snap.mapType;
+      if (transportModeSelect) transportModeSelect.value = snap.transportMode;
+      seedDisplay.textContent = String(snap.seed);
+    }
+    state.running = false;
+    updatePlayButton();
+    resetView();
+    renderTerrainCache();      // repaint restored terrain
+    applyCities(snap ? snap.cities : []); // rebuild worker WITH terrain restored
+    realPlaceHint.textContent = 'Pick a region to compare the AI’s optimized loop (left) against the real transport network (right).';
+    if (state.cities.length === 0) showInstructions();
+  }
+
+  function comparePanelPath(rect, r) {
+    const x = rect.x, y = rect.y, w = rect.w, h = rect.h;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawCompareDots(P) {
+    const names = state.realNames || [];
+    const dense = P.length > 15;
+    for (let i = 0; i < P.length; i++) {
+      const c = P[i];
+      const isStart = i === 0;
+      ctx.beginPath();
+      ctx.fillStyle = isStart ? START_COLOR : CITY_COLOR;
+      ctx.shadowColor = isStart ? START_COLOR : CITY_COLOR;
+      ctx.shadowBlur = isStart ? 10 : 6;
+      ctx.arc(c.x, c.y, isStart ? 5 : 3.6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      if (names[i]) {
+        ctx.font = (dense ? '9px' : '10px') + ' -apple-system, Segoe UI, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillStyle = 'rgba(232,236,246,0.72)';
+        ctx.fillText(names[i], c.x, c.y - 6);
+      }
+    }
+  }
+
+  function drawComparePanel(rect, title, subtitle, which) {
+    ctx.save();
+    comparePanelPath(rect, 10);
+    ctx.fillStyle = 'rgba(255,255,255,0.02)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.clip();
+
+    const pts = state.realPts;
+    if (pts && pts.length) {
+      const P = pts.map(function (p) { return { x: rect.x + p.x, y: rect.y + p.y }; });
+      if (which === 'left') {
+        // AI's current best TSP loop (straight legs on the projection).
+        const tour = state.bestTour;
+        if (tour && tour.length >= 2) {
+          ctx.beginPath();
+          for (let k = 0; k < tour.length; k++) {
+            const c = P[tour[k]];
+            if (!c) break;
+            if (k === 0) ctx.moveTo(c.x, c.y); else ctx.lineTo(c.x, c.y);
+          }
+          ctx.closePath();
+          ctx.strokeStyle = ACCENT;
+          ctx.lineWidth = 2.4;
+          ctx.shadowColor = ACCENT;
+          ctx.shadowBlur = 10;
+          ctx.stroke();
+          ctx.shadowBlur = 0;
+        }
+      } else {
+        // The region's real transport network (baked edges) — fixed, never
+        // touched by the solver.
+        const edges = state.realEdges || [];
+        ctx.strokeStyle = '#9b6bff';
+        ctx.lineWidth = 2.4;
+        ctx.shadowColor = 'rgba(155,107,255,0.8)';
+        ctx.shadowBlur = 8;
+        for (let e = 0; e < edges.length; e++) {
+          const a = P[edges[e][0]], b = P[edges[e][1]];
+          if (!a || !b) continue;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+        ctx.shadowBlur = 0;
+      }
+      drawCompareDots(P);
+    }
+
+    // Panel labels.
+    ctx.font = '600 13px -apple-system, Segoe UI, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = which === 'left' ? ACCENT : '#b79bff';
+    ctx.fillText(title, rect.x + 12, rect.y + 10);
+    ctx.font = '400 10.5px -apple-system, Segoe UI, sans-serif';
+    ctx.fillStyle = 'rgba(232,236,246,0.5)';
+    ctx.fillText(subtitle, rect.x + 12, rect.y + 28);
+    ctx.restore();
+  }
+
+  function renderComparison() {
+    const layout = state.compareLayout || computeCompareLayout();
+    const w = layout.w, h = layout.h;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#0d1220';
+    ctx.fillRect(0, 0, w, h);
+    const region = REAL_REGIONS[state.compareRegion];
+    const netLabel = region ? region.netLabel : 'real network';
+    drawComparePanel(layout.a, 'AI route', 'genetic algorithm + 2-opt', 'left');
+    drawComparePanel(layout.b, 'Real network', netLabel, 'right');
+  }
+
   function render() {
+    // Real-place comparison mode owns the whole canvas — draw the twin panels
+    // and skip the terrain/route pipeline entirely.
+    if (state.compareRegion) { renderComparison(); return; }
+
     const w = canvas.clientWidth || 1;
     const h = canvas.clientHeight || 1;
     ctx.clearRect(0, 0, w, h);
@@ -3575,6 +3958,9 @@ self.onmessage = function (e) {
     // A drag-pan (or pinch) ends by firing a click; swallow that one so a pan
     // gesture never accidentally drops a city.
     if (suppressClick) { suppressClick = false; return; }
+    // In comparison mode the cities are the region's fixed real places — the
+    // canvas isn't a place-a-city surface.
+    if (state.compareRegion) return;
     const rect = canvas.getBoundingClientRect();
     // Screen -> world through the inverse view transform, so a city lands
     // exactly under the cursor at any zoom/pan.
@@ -3729,11 +4115,27 @@ self.onmessage = function (e) {
   }
 
   resetBtn.addEventListener('click', function () {
+    // In comparison mode "Reset" re-seeds the AI over the same real cities
+    // (fresh worker + population) rather than clearing the fixed region.
+    if (state.compareRegion) {
+      state.running = false;
+      updatePlayButton();
+      layoutCompareCities();
+      return;
+    }
     state.cities = [];
     state.running = false;
     updatePlayButton();
     handleCitiesChanged();
     showInstructions();
+  });
+
+  // Real-place comparison dropdown: pick a region to enter twin-panel
+  // comparison mode; pick "none" to restore the terrain sandbox.
+  realPlaceSelect.addEventListener('change', function () {
+    const key = realPlaceSelect.value;
+    if (key && REAL_REGIONS[key]) enterCompareMode(key);
+    else exitCompareMode();
   });
 
   randomBtn.addEventListener('click', function () {
