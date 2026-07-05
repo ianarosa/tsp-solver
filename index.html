@@ -910,6 +910,18 @@
   // =========================================================================
   const view = { scale: 1, minScale: 1, maxScale: 8, offsetX: 0, offsetY: 0 };
 
+  // The world-rect + device resolution that the offscreen terrain/route caches
+  // are CURRENTLY rendered for. render() blits each cache at (x,y,w,h) in world
+  // space under the view transform, so a cache rendered for the visible region
+  // at device resolution stays pixel-crisp at any zoom. Updated only on a
+  // gesture SETTLE (debounced) — during an active zoom/pan the stale cache is
+  // just blit-scaled by the view transform (cheap ~60fps preview), then a sharp
+  // re-render snaps in ~150ms after the gesture stops. Defaults to the full
+  // viewport; computeRenderRegion() recomputes it. `density` = cache px per
+  // world unit (== view.scale * dpr, capped so the buffer stays bounded).
+  const renderRegion = { x: 0, y: 0, w: 1, h: 1, pxW: 1, pxH: 1, density: 1 };
+  const MAX_TERRAIN_PX = 1900000; // cap on cache pixels — bounds settle-render cost on hi-dpr / mobile
+
   function screenToWorld(sx, sy) {
     return { x: (sx - view.offsetX) / view.scale, y: (sy - view.offsetY) / view.scale };
   }
@@ -2453,7 +2465,13 @@ self.onmessage = function (e) {
     const terrain = {
       seed: seed, mapType: mapType, cellSize: cellSize, cols: cols, rows: rows,
       worldW: cols * cellSize, worldH: rows * cellSize,
-      elevation: elevation, moisture: moisture, cellType: cellType, riverMask: riverMask
+      elevation: elevation, moisture: moisture, cellType: cellType, riverMask: riverMask,
+      // Generation knobs, kept so the VISUAL terrain can resample the fbm field
+      // continuously (per output pixel) at any zoom — decoupling the crisp map
+      // picture from the coarse routing grid above. The worker/Dijkstra only ever
+      // read the grid arrays; these are render-only.
+      seaLevel: seaLevel, elevScale: elevScale, moistScale: moistScale,
+      falloff: falloff, ridge: ridge, hillsLevel: hillsLevel, mountainLevel: mountainLevel
     };
     // NOTE: do NOT Object.freeze() the typed arrays — Object.freeze() on a
     // non-empty TypedArray throws "Cannot freeze array buffer views with
@@ -2687,13 +2705,16 @@ self.onmessage = function (e) {
   function resizeAll() {
     fitCanvasToContainer(canvas);
     fitCanvasToContainer(chartCanvas);
-    // The canvas backing store changed size — the cached route layer must be
-    // resized (in sizeRouteLayer) and repainted to match.
-    state.routeLayerDirty = true;
     // The viewport changed size, so pan clamps (which depend on w/h) may now be
     // violated — re-clamp and refresh the reset-view affordance.
     clampView();
     updateViewUI();
+    // Recompute the cache region for the new viewport NOW (cheap) so the route
+    // layer repaints at the right size/place this frame; the heavier per-pixel
+    // terrain re-render is debounced so a live window-drag stays smooth.
+    computeRenderRegion();
+    state.routeLayerDirty = true;
+    scheduleSettle();
   }
 
   if (window.ResizeObserver) {
@@ -2730,10 +2751,17 @@ self.onmessage = function (e) {
   // land identically in both. fitCanvasToContainer() can't be reused here
   // because a detached offscreen canvas has no layout box to measure.
   function sizeRouteLayer() {
-    const dpr = window.devicePixelRatio || 1;
-    if (routeLayer.width !== canvas.width) routeLayer.width = canvas.width;
-    if (routeLayer.height !== canvas.height) routeLayer.height = canvas.height;
-    routeLayerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const pxW = Math.max(1, renderRegion.pxW | 0), pxH = Math.max(1, renderRegion.pxH | 0);
+    if (routeLayer.width !== pxW) routeLayer.width = pxW;
+    if (routeLayer.height !== pxH) routeLayer.height = pxH;
+    // Map world -> cache pixels: scale by the region density, translate by the
+    // region origin. City/tour coords are in world space, so the existing draw
+    // helpers paint them at exactly the resolution the current zoom needs — the
+    // tour/dots stay crisp when zoomed in instead of blit-upscaling a fixed
+    // viewport-res bitmap. (Marker px sizes ride the same density, so their
+    // on-screen size after the view blit is unchanged.)
+    const d = renderRegion.density;
+    routeLayerCtx.setTransform(d, 0, 0, d, -renderRegion.x * d, -renderRegion.y * d);
   }
 
   // Repaint the whole route layer from scratch. Temporarily repoints `ctx` at
@@ -2742,9 +2770,10 @@ self.onmessage = function (e) {
   // unchanged, then restores it. Consumes the dirty flag.
   function renderRouteLayer() {
     sizeRouteLayer();
-    const w = canvas.clientWidth || 1;
-    const h = canvas.clientHeight || 1;
-    routeLayerCtx.clearRect(0, 0, w, h);
+    routeLayerCtx.save();
+    routeLayerCtx.setTransform(1, 0, 0, 1, 0, 0);
+    routeLayerCtx.clearRect(0, 0, routeLayer.width, routeLayer.height);
+    routeLayerCtx.restore();
     const prevCtx = ctx;
     ctx = routeLayerCtx;
     if (state.cities.length >= 2) {
@@ -2759,45 +2788,191 @@ self.onmessage = function (e) {
     state.routeLayerDirty = false;
   }
 
-  function terrainColor(type, elevation, isRiver) {
-    if (isRiver) return [70, 140, 220];
-    switch (type) {
-      case TERRAIN_OCEAN: {
-        const t = Math.max(0, Math.min(1, elevation / 0.5));
-        return [8 + t * 20, 30 + t * 50, 58 + t * 70];
-      }
-      case TERRAIN_COAST: return [199, 182, 138];
-      case TERRAIN_FOREST: return [58, 97, 64];
-      case TERRAIN_HILLS: return [128, 112, 82];
-      case TERRAIN_MOUNTAIN: {
-        const t = Math.max(0, Math.min(1, (elevation - 0.6) / 0.4));
-        return [110 + (226 - 110) * t, 104 + (222 - 104) * t, 112 + (224 - 112) * t];
-      }
-      case TERRAIN_PLAINS:
-      default: return [141, 163, 96];
-    }
+  // Smooth 0..1 ramp between edges a and b (for softening biome/depth bands).
+  function sstep(a, b, x) {
+    if (x <= a) return 0;
+    if (x >= b) return 1;
+    const t = (x - a) / (b - a);
+    return t * t * (3 - 2 * t);
   }
 
-  function renderTerrainCache() {
+  // Bilinear read of a coarse grid array (cols x rows) at fractional grid
+  // coords, so grid-derived fields (moisture, river) upsample smoothly instead
+  // of showing hard cell blocks when zoomed.
+  function bilinearGrid(arr, cols, rows, fx, fy) {
+    if (fx < 0) fx = 0; else if (fx > cols - 1) fx = cols - 1;
+    if (fy < 0) fy = 0; else if (fy > rows - 1) fy = rows - 1;
+    const x0 = fx | 0, y0 = fy | 0;
+    const x1 = x0 < cols - 1 ? x0 + 1 : x0, y1 = y0 < rows - 1 ? y0 + 1 : y0;
+    const tx = fx - x0, ty = fy - y0;
+    const a = arr[y0 * cols + x0], b = arr[y0 * cols + x1];
+    const c = arr[y1 * cols + x0], d = arr[y1 * cols + x1];
+    return (a + (b - a) * tx) * (1 - ty) + (c + (d - c) * tx) * ty;
+  }
+
+  // Decide the world-rect + device resolution the offscreen caches should be
+  // rendered at for the CURRENT view: the (padded) visible world region, at
+  // ~1 cache pixel per on-screen device pixel (so it's crisp at this zoom),
+  // capped so the buffer stays bounded on hi-dpr / mobile. See renderRegion.
+  function computeRenderRegion() {
+    const w = canvas.clientWidth || 1, h = canvas.clientHeight || 1;
+    const dpr = window.devicePixelRatio || 1;
+    const t = state.terrain;
+    const boundW = t ? t.worldW : w, boundH = t ? t.worldH : h;
+    const tl = screenToWorld(0, 0), br = screenToWorld(w, h);
+    const padX = (br.x - tl.x) * 0.12, padY = (br.y - tl.y) * 0.12;
+    let x0 = tl.x - padX, y0 = tl.y - padY, x1 = br.x + padX, y1 = br.y + padY;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > boundW) x1 = boundW;
+    if (y1 > boundH) y1 = boundH;
+    if (x1 - x0 < 1) x1 = x0 + 1;
+    if (y1 - y0 < 1) y1 = y0 + 1;
+    const rw = x1 - x0, rh = y1 - y0;
+    let density = view.scale * dpr;
+    let pxW = Math.round(rw * density), pxH = Math.round(rh * density);
+    const total = pxW * pxH;
+    if (total > MAX_TERRAIN_PX) {
+      const s = Math.sqrt(MAX_TERRAIN_PX / total);
+      density *= s;
+      pxW = Math.round(rw * density);
+      pxH = Math.round(rh * density);
+    }
+    renderRegion.x = x0; renderRegion.y = y0; renderRegion.w = rw; renderRegion.h = rh;
+    renderRegion.pxW = Math.max(1, pxW); renderRegion.pxH = Math.max(1, pxH);
+    renderRegion.density = density;
+  }
+
+  // Paint the terrain cache for the current renderRegion, per output pixel:
+  // the elevation field is RESAMPLED from the same fbm the routing grid was
+  // built from (continuous, so no coarse-grid blocks when zoomed), then shaded
+  // for sea depth, coastal beach/foam, softened biome bands and slope-based
+  // hillshade relief. The coarse grid + worker/Dijkstra are untouched.
+  function renderTerrainRegion() {
     const t = state.terrain;
     if (!t) return;
-    terrainCache.width = t.cols;
-    terrainCache.height = t.rows;
-    const img = terrainCacheCtx.createImageData(t.cols, t.rows);
-    const cellCount = t.cols * t.rows;
-    for (let idx = 0; idx < cellCount; idx++) {
-      const isRiver = t.riverMask[idx] === 1;
-      const col = terrainColor(t.cellType[idx], t.elevation[idx], isRiver);
-      const p = idx * 4;
-      img.data[p] = col[0] | 0;
-      img.data[p + 1] = col[1] | 0;
-      img.data[p + 2] = col[2] | 0;
-      img.data[p + 3] = 255;
+    const pxW = renderRegion.pxW, pxH = renderRegion.pxH;
+    terrainCache.width = pxW;
+    terrainCache.height = pxH;
+    const img = terrainCacheCtx.createImageData(pxW, pxH);
+    const data = img.data;
+    const cols = t.cols, rows = t.rows, cellSize = t.cellSize;
+    const seed = t.seed, elevScale = t.elevScale, ridge = t.ridge, falloff = t.falloff;
+    const seaLevel = t.seaLevel, hillsLevel = t.hillsLevel, mountainLevel = t.mountainLevel;
+    const worldW = t.worldW, worldH = t.worldH;
+    const moistureGrid = t.moisture, riverGrid = t.riverMask;
+    const rx = renderRegion.x, ry = renderRegion.y;
+    const dwx = renderRegion.w / pxW, dwy = renderRegion.h / pxH;
+    const ex = elevScale / cols, ey = elevScale / rows;
+
+    // Pass 1 — continuous elevation field (matches the grid at cell origins).
+    const elevBuf = new Float32Array(pxW * pxH);
+    for (let y = 0; y < pxH; y++) {
+      const wy = ry + (y + 0.5) * dwy;
+      const rf = wy / cellSize;
+      const ny = wy / worldH - 0.5;
+      const rowOff = y * pxW;
+      for (let x = 0; x < pxW; x++) {
+        const wx = rx + (x + 0.5) * dwx;
+        const cf = wx / cellSize;
+        let e = fbm2D(cf * ex, rf * ey, seed, 5, 2.0, 0.5);
+        if (ridge) e = 1 - Math.abs(e * 2 - 1);
+        const nx = wx / worldW - 0.5;
+        const rad = Math.sqrt(nx * nx + ny * ny) * 1.4142;
+        elevBuf[rowOff + x] = e - falloff * rad * rad;
+      }
+    }
+
+    // Pass 2 — shade. Light comes from the NW; RELIEF scales slope->brightness.
+    const LX = 0.82, LY = 0.82, RELIEF = 62;
+    const g2x = 1 / (2 * dwx), g2y = 1 / (2 * dwy);
+    for (let y = 0; y < pxH; y++) {
+      const rowOff = y * pxW;
+      const upOff = (y > 0 ? y - 1 : y) * pxW;
+      const dnOff = (y < pxH - 1 ? y + 1 : y) * pxW;
+      const wy = ry + (y + 0.5) * dwy;
+      const rf = wy / cellSize;
+      for (let x = 0; x < pxW; x++) {
+        const i = rowOff + x;
+        const e = elevBuf[i];
+        const wx = rx + (x + 0.5) * dwx;
+        const cf = wx / cellSize;
+        let r, g, b;
+        if (e < seaLevel) {
+          // Ocean: deep saturated blue -> shallow turquoise toward the coast.
+          const sh = sstep(seaLevel - 0.26, seaLevel, e); // 0 deep .. 1 shore
+          r = 10 + (78 - 10) * sh;
+          g = 38 + (156 - 38) * sh;
+          b = 78 + (160 - 78) * sh;
+          // Gentle static wave texture (keyed to world space -> doesn't swim).
+          const wv = (valueNoise2D(wx * 0.05, wy * 0.05, (seed ^ 0x5EA1) >>> 0) - 0.5)
+                   + (valueNoise2D(wx * 0.19, wy * 0.14, (seed ^ 0x71D3) >>> 0) - 0.5) * 0.5;
+          const wa = 7 * (1 - 0.5 * sh);
+          r += wv * wa * 0.5; g += wv * wa; b += wv * wa;
+          // Bright foam line right at the waterline.
+          const foam = sstep(seaLevel - 0.012, seaLevel, e);
+          r += foam * 42; g += foam * 48; b += foam * 42;
+        } else {
+          // Land: plains<->forest by moisture, then hills, then mountain+snow.
+          const m = bilinearGrid(moistureGrid, cols, rows, cf, rf);
+          const fmix = sstep(0.48, 0.63, m);
+          let lr = 128 + (58 - 128) * fmix, lg = 158 + (99 - 158) * fmix, lb = 92 + (64 - 92) * fmix;
+          const hmix = sstep(hillsLevel - 0.035, hillsLevel + 0.02, e);
+          lr += (150 - lr) * hmix; lg += (132 - lg) * hmix; lb += (96 - lb) * hmix;
+          const mmix = sstep(mountainLevel - 0.03, mountainLevel + 0.03, e);
+          const snow = sstep(mountainLevel + 0.05, mountainLevel + 0.20, e);
+          const mr = 120 + (238 - 120) * snow, mg = 118 + (240 - 118) * snow, mb = 126 + (245 - 126) * snow;
+          lr += (mr - lr) * mmix; lg += (mg - lg) * mmix; lb += (mb - lb) * mmix;
+          // Sandy beach ring on low, flat coast (not on cliffs/hills/mountains).
+          const beach = (1 - sstep(seaLevel + 0.006, seaLevel + 0.028, e)) * (1 - hmix) * (1 - mmix);
+          lr += (216 - lr) * beach; lg += (200 - lg) * beach; lb += (150 - lb) * beach;
+          // Hillshade relief from the elevation gradient (zoom-invariant).
+          const xp = x < pxW - 1 ? x + 1 : x, xm = x > 0 ? x - 1 : x;
+          const gx = (elevBuf[rowOff + xp] - elevBuf[rowOff + xm]) * g2x;
+          const gy = (elevBuf[dnOff + x] - elevBuf[upOff + x]) * g2y;
+          let shd = 1 + (-gx * LX - gy * LY) * RELIEF;
+          if (shd < 0.62) shd = 0.62; else if (shd > 1.45) shd = 1.45;
+          lr *= shd; lg *= shd; lb *= shd;
+          // Rivers stay clearly readable as blue threads over the land.
+          const rv = bilinearGrid(riverGrid, cols, rows, cf, rf);
+          const rmix = sstep(0.12, 0.5, rv);
+          lr += (70 - lr) * rmix; lg += (150 - lg) * rmix; lb += (222 - lb) * rmix;
+          r = lr; g = lg; b = lb;
+        }
+        const p = i * 4;
+        data[p] = r < 0 ? 0 : r > 255 ? 255 : r;
+        data[p + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
+        data[p + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+        data[p + 3] = 255;
+      }
     }
     terrainCacheCtx.putImageData(img, 0, 0);
-    // The route layer draws terrain-dependent details (coastal city rings,
-    // port positions), so a terrain change invalidates it too.
+  }
+
+  // Recompute the render region for the current view and repaint the terrain
+  // cache into it. Also flags the route layer stale (its region/resolution
+  // follows the same renderRegion, and terrain-dependent details — coastal city
+  // rings, port positions — must repaint). Used for the initial/regenerated map
+  // AND for the debounced sharp re-render after a zoom/pan gesture settles.
+  function renderTerrainCache() {
+    computeRenderRegion();
+    renderTerrainRegion();
     state.routeLayerDirty = true;
+  }
+
+  // Debounced "settle" re-render. During an active zoom/pan the existing caches
+  // are just blit-scaled by the view transform (cheap ~60fps preview); ~150ms
+  // after the last gesture event this fires and re-renders the caches sharp for
+  // the new view. Never fires while a pointer is still down (drag/pinch still in
+  // progress) — it just reschedules until the gesture actually ends.
+  let settleTimer = null;
+  function scheduleSettle() {
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = setTimeout(function () {
+      settleTimer = null;
+      if (pointers.size > 0) { scheduleSettle(); return; }
+      renderTerrainCache();
+    }, 150);
   }
 
   // =========================================================================
@@ -2848,14 +3023,17 @@ self.onmessage = function (e) {
     ctx.restore();
   }
 
-  function drawTerrainBackground(w, h) {
-    ctx.fillStyle = '#0d1220';
-    ctx.fillRect(0, 0, w, h);
+  function drawTerrainBackground() {
     const t = state.terrain;
     if (!t) return;
     const prevSmoothing = ctx.imageSmoothingEnabled;
     ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(terrainCache, 0, 0, t.worldW, t.worldH);
+    // Blit the terrain cache at the world-rect it was rendered for. When that
+    // rect matches the current view (post-settle) the cache is device-resolution
+    // and stays crisp; during an active gesture it's the previous rect and the
+    // view transform just scales it as a fast preview.
+    const r = renderRegion;
+    ctx.drawImage(terrainCache, r.x, r.y, r.w, r.h);
     ctx.imageSmoothingEnabled = prevSmoothing;
   }
 
@@ -3068,6 +3246,11 @@ self.onmessage = function (e) {
     const w = canvas.clientWidth || 1;
     const h = canvas.clientHeight || 1;
     ctx.clearRect(0, 0, w, h);
+    // Base background in SCREEN space (outside the view transform) so it always
+    // fills the viewport, even when the terrain region doesn't reach an edge
+    // mid-gesture.
+    ctx.fillStyle = '#0d1220';
+    ctx.fillRect(0, 0, w, h);
 
     // Re-render the cached route layer (if stale) BEFORE applying the view
     // transform: renderRouteLayer() paints into its own offscreen context at
@@ -3085,10 +3268,8 @@ self.onmessage = function (e) {
     ctx.scale(view.scale, view.scale);
 
     if (state.terrain) {
-      drawTerrainBackground(w, h);
+      drawTerrainBackground();
     } else {
-      ctx.fillStyle = '#0d1220';
-      ctx.fillRect(0, 0, w, h);
       drawGrid(w, h);
     }
 
@@ -3096,8 +3277,9 @@ self.onmessage = function (e) {
     // cached route layer (see renderRouteLayer). It's re-rendered only when
     // stale (a better tour arrived, cities/terrain/mode/size changed); here we
     // just blit it under the view transform — this is what keeps large city
-    // counts at ~60fps instead of re-stroking every leg every frame.
-    ctx.drawImage(routeLayer, 0, 0, w, h);
+    // counts at ~60fps instead of re-stroking every leg every frame. Blit at the
+    // world-rect the layer was rendered for (same renderRegion as the terrain).
+    ctx.drawImage(routeLayer, renderRegion.x, renderRegion.y, renderRegion.w, renderRegion.h);
 
     // Live per-frame transients that are anchored in world space (the
     // rejected-click "ocean flash" pulses) ride the same transform so they land
@@ -3262,6 +3444,7 @@ self.onmessage = function (e) {
     // independent zoom that's symmetric in and out.
     const factor = Math.exp(-e.deltaY * 0.0015);
     zoomAt(sx, sy, factor);
+    scheduleSettle();
   }, { passive: false });
 
   canvas.addEventListener('pointerdown', function (e) {
@@ -3299,6 +3482,7 @@ self.onmessage = function (e) {
       }
       pinchPrevDist = dist;
       suppressClick = true;
+      scheduleSettle();
       return;
     }
 
@@ -3313,6 +3497,7 @@ self.onmessage = function (e) {
     view.offsetX = panStartOffX + dx;
     view.offsetY = panStartOffY + dy;
     clampView();
+    scheduleSettle();
   });
 
   function endPointer(e) {
@@ -3326,7 +3511,7 @@ self.onmessage = function (e) {
   canvas.addEventListener('pointerup', endPointer);
   canvas.addEventListener('pointercancel', endPointer);
 
-  resetViewBtn.addEventListener('click', function () { resetView(); });
+  resetViewBtn.addEventListener('click', function () { resetView(); renderTerrainCache(); });
 
   mapLegendToggle.addEventListener('click', function () {
     mapLegend.classList.toggle('collapsed');
