@@ -69,19 +69,115 @@
     padding:12px;
   }
 
+  /* Visually-hidden helper for the screen-reader live region. */
+  .sr-only{
+    position:absolute;
+    width:1px; height:1px;
+    padding:0; margin:-1px;
+    overflow:hidden;
+    clip:rect(0,0,0,0);
+    white-space:nowrap;
+    border:0;
+  }
+
+  /* ---------- Mobile control drawer ---------- */
+  /* On desktop the drawer toggle + scrim don't exist; the panel is a normal
+     column. On narrow screens (below) the whole controls/stats panel becomes a
+     bottom sheet so the map gets the full screen instead of a long scroll. */
+  .drawer-toggle{ display:none; }
+  .drawer-scrim{ display:none; }
+
   @media (max-width: 860px){
     .app{
-      flex-direction:column;
-      overflow-y:auto;
-    }
-    .panel{
-      flex:0 0 auto;
-      width:100%;
-      max-width:none;
+      padding:8px;
+      gap:0;
+      overflow:hidden;
     }
     .map-wrap{
-      min-height:68vh;
-      flex:0 0 68vh;
+      flex:1 1 auto;
+      min-height:0;
+    }
+
+    /* Floating "Controls" button that opens the bottom sheet. */
+    .drawer-toggle{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      position:fixed;
+      left:12px;
+      bottom:12px;
+      z-index:38;
+      min-height:44px;
+      padding:11px 17px;
+      font-size:13px;
+      font-weight:700;
+      letter-spacing:0.2px;
+      color:#04231e;
+      background:linear-gradient(135deg, var(--accent), #29b8a6);
+      border:none;
+      border-radius:12px;
+      box-shadow:0 6px 18px rgba(0,0,0,0.45);
+    }
+
+    /* The panel becomes a slide-up bottom sheet. transform (not display) keeps
+       its layout box measurable, so the convergence canvas stays sized even
+       while hidden. Selector is `.app .panel` (not `.panel`) so it out-weighs
+       the later base `.panel{width:300px}` rule regardless of source order. */
+    .app .panel{
+      position:fixed;
+      left:0; right:0; bottom:0;
+      width:100%;
+      max-width:none;
+      max-height:82vh;
+      border-radius:20px 20px 0 0;
+      transform:translateY(102%);
+      transition:transform 0.28s cubic-bezier(.4,0,.2,1);
+      z-index:40;
+      padding-bottom:26px;
+      box-shadow:0 -14px 40px rgba(0,0,0,0.5), inset 0 0 0 1px var(--border);
+    }
+    /* Grab-handle affordance at the top of the sheet. */
+    .panel::before{
+      content:"";
+      position:sticky;
+      top:0;
+      display:block;
+      width:44px;
+      height:4px;
+      margin:0 auto 4px;
+      border-radius:999px;
+      background:rgba(255,255,255,0.22);
+    }
+    body.drawer-open .panel{ transform:translateY(0); }
+
+    .drawer-scrim{
+      display:block;
+      position:fixed;
+      inset:0;
+      background:rgba(4,6,12,0.55);
+      opacity:0;
+      pointer-events:none;
+      transition:opacity 0.28s ease;
+      z-index:35;
+    }
+    body.drawer-open .drawer-scrim{ opacity:1; pointer-events:auto; }
+
+    /* Comfortable ~44px touch targets for the controls. */
+    .panel button,
+    .panel select,
+    .panel input[type="number"]{ min-height:44px; }
+    .panel .btn-row button{ flex:1 1 auto; }
+    .reset-view-btn,
+    .map-legend-toggle{ min-height:40px; }
+  }
+
+  /* Users who ask for less motion: kill the drawer slide, hover/press easing
+     and instruction fades. The sim itself is already rate-limited by the speed
+     slider, so nothing else needs touching. */
+  @media (prefers-reduced-motion: reduce){
+    *{
+      transition-duration:0.01ms !important;
+      animation-duration:0.01ms !important;
     }
   }
 
@@ -450,15 +546,15 @@
 
   <div class="app">
     <div class="map-wrap" id="mapWrap">
-      <canvas id="mapCanvas"></canvas>
+      <canvas id="mapCanvas" role="application" tabindex="0" aria-label="Interactive terrain map — tap to place cities, drag to pan, scroll or pinch to zoom"></canvas>
       <div class="instructions" id="instructions">
         Click the map to drop cities, or hit <b>Random Cities</b>, then press <b>Play</b>. Scroll to zoom, drag to pan.
       </div>
 
-      <button class="reset-view-btn" id="resetViewBtn" title="Reset zoom &amp; pan">&#10530; Reset view</button>
+      <button class="reset-view-btn" id="resetViewBtn" title="Reset zoom &amp; pan" aria-label="Reset zoom and pan to fit">&#10530; Reset view</button>
 
       <div class="map-legend" id="mapLegend">
-        <button class="map-legend-toggle" id="mapLegendToggle">Transport &#9662;</button>
+        <button class="map-legend-toggle" id="mapLegendToggle" aria-label="Toggle transport legend" aria-expanded="true" aria-controls="mapLegendBody">Transport &#9662;</button>
         <div class="map-legend-body" id="mapLegendBody">
           <span class="map-legend-row"><i style="background:#f5a623;"></i>&#128663; Highway</span>
           <span class="map-legend-row"><i style="background:#9b6bff;"></i>&#128646; Train</span>
@@ -469,34 +565,37 @@
       </div>
     </div>
 
-    <aside class="panel">
+    <button class="drawer-toggle" id="drawerToggle" aria-label="Open controls and stats panel" aria-controls="controlPanel" aria-expanded="false">&#9776; Controls</button>
+    <div class="drawer-scrim" id="drawerScrim"></div>
+
+    <aside class="panel" id="controlPanel" aria-label="Controls and statistics">
 
       <div class="section">
         <h2>Run</h2>
         <label class="field">
           <div class="field-head"><span>Algorithm</span></div>
-          <select id="algoSelect">
+          <select id="algoSelect" aria-label="Solver algorithm">
             <option value="ga" selected>Genetic Algorithm</option>
             <option value="2opt">2-opt (greedy local search)</option>
             <option value="nn">Nearest Neighbor (baseline)</option>
           </select>
         </label>
         <div class="btn-row">
-          <button class="primary" id="playBtn">&#9654; Play</button>
-          <button id="shuffleBtn">&#8635; Shuffle / Restart</button>
-          <button id="resetBtn">Reset</button>
+          <button class="primary" id="playBtn" aria-label="Play">&#9654; Play</button>
+          <button id="shuffleBtn" aria-label="Shuffle and restart evolution">&#8635; Shuffle / Restart</button>
+          <button id="resetBtn" aria-label="Clear all cities">Reset</button>
         </div>
       </div>
 
       <div class="section">
         <h2>Cities</h2>
         <div class="row-inline">
-          <button id="randomBtn">Add Random Cities</button>
-          <input type="number" id="randomCount" value="30" min="1" max="1000" step="1">
+          <button id="randomBtn" aria-label="Add random cities">Add Random Cities</button>
+          <input type="number" id="randomCount" value="30" min="1" max="1000" step="1" aria-label="Number of random cities to add">
         </div>
         <div class="hint">Click anywhere on the map to drop a single city.</div>
         <div class="row-inline">
-          <select id="presetSelect">
+          <select id="presetSelect" aria-label="Load a preset city layout">
             <option value="custom" selected>Preset…</option>
             <option value="circle">Circle</option>
             <option value="grid">Grid</option>
@@ -506,7 +605,7 @@
         </div>
         <div class="hint">Presets replace the current cities and restart evolution.</div>
         <div class="row-inline">
-          <button id="copyLinkBtn">Copy Link</button>
+          <button id="copyLinkBtn" aria-label="Copy a shareable link to this map">Copy Link</button>
         </div>
         <div class="hint">Copies a URL that reproduces the exact same cities, world and mode.</div>
       </div>
@@ -515,7 +614,7 @@
         <h2>World</h2>
         <label class="field">
           <div class="field-head"><span>Map type</span></div>
-          <select id="mapTypeSelect">
+          <select id="mapTypeSelect" aria-label="Map / terrain type">
             <option value="continent" selected>Continent</option>
             <option value="islands">Islands</option>
             <option value="river">River valley</option>
@@ -524,12 +623,12 @@
           </select>
         </label>
         <div class="row-inline">
-          <button id="regenerateBtn">&#8635; New Map</button>
+          <button id="regenerateBtn" aria-label="Generate a new random map">&#8635; New Map</button>
           <span class="hint">Seed: <span id="seedDisplay">—</span></span>
         </div>
         <label class="field">
           <div class="field-head"><span>Transport mode</span></div>
-          <select id="transportModeSelect">
+          <select id="transportModeSelect" aria-label="Transport mode">
             <option value="best" selected>Best (multimodal)</option>
             <option value="highway">&#128663; Highway</option>
             <option value="train">&#128646; Train</option>
@@ -545,19 +644,19 @@
 
         <label class="field">
           <div class="field-head"><span>Speed (generations / sec)</span><span class="val" id="speedValue">11 / s</span></div>
-          <input type="range" id="speedSlider" min="1" max="21" step="1" value="10">
+          <input type="range" id="speedSlider" min="1" max="21" step="1" value="10" aria-label="Speed in generations per second">
           <div class="hint">Low = step slowly so you can watch crossings vanish; top = MAX (unlimited full speed).</div>
         </label>
 
         <label class="field">
           <div class="field-head"><span>Population size</span><span class="val" id="popValue">120</span></div>
-          <input type="range" id="popSlider" min="10" max="300" step="1" value="120">
+          <input type="range" id="popSlider" min="10" max="300" step="1" value="120" aria-label="Population size">
           <div class="hint">Changing this restarts evolution with a fresh population at the new size.</div>
         </label>
 
         <label class="field">
           <div class="field-head"><span>Mutation rate</span><span class="val" id="mutValue">8%</span></div>
-          <input type="range" id="mutSlider" min="0" max="100" step="1" value="8">
+          <input type="range" id="mutSlider" min="0" max="100" step="1" value="8" aria-label="Mutation rate percent">
         </label>
       </div>
 
@@ -637,6 +736,8 @@
     </aside>
   </div>
 
+  <div id="srStatus" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
 <script>
 (function(){
   'use strict';
@@ -655,6 +756,9 @@
   const resetViewBtn = document.getElementById('resetViewBtn');
   const mapLegend = document.getElementById('mapLegend');
   const mapLegendToggle = document.getElementById('mapLegendToggle');
+  const drawerToggle = document.getElementById('drawerToggle');
+  const drawerScrim = document.getElementById('drawerScrim');
+  const srStatus = document.getElementById('srStatus');
 
   const chartCanvas = document.getElementById('convergenceChart');
   const chartCtx = chartCanvas.getContext('2d');
@@ -2776,6 +2880,19 @@ self.onmessage = function (e) {
   // mode with a small glyph at each leg's midpoint; otherwise (Flat map, or
   // terrain-aware paths not received yet) falls back to the original
   // straight-leg rendering.
+  // Scale factor for city dots, port markers and mode glyphs. Shrinks on small
+  // (mobile) canvases, and gently as the city count climbs, so dense maps stay
+  // readable instead of a mash of overlapping markers. Returns 1 on a roomy
+  // desktop canvas with a modest city count, so the desktop look is unchanged.
+  function markerScale() {
+    const w = canvas.clientWidth || 600, h = canvas.clientHeight || 400;
+    const small = Math.min(w, h);
+    let s = small < 520 ? Math.max(0.6, small / 520) : 1;
+    const nc = state.cities.length;
+    if (nc > 45) s *= Math.max(0.62, 1 - (nc - 45) / 420);
+    return s;
+  }
+
   function drawBestTourRoutes() {
     const tour = state.bestTour;
     if (!tour || tour.length < 2) return;
@@ -2836,14 +2953,15 @@ self.onmessage = function (e) {
 
   function drawLegGlyph(pts, glyph) {
     if (!glyph || !pts || pts.length < 2) return;
+    const ms = Math.max(0.78, markerScale()); // floor keeps glyphs legible when tiny
     const mid = pts[Math.floor(pts.length / 2)];
     ctx.save();
-    ctx.font = '11px sans-serif';
+    ctx.font = (11 * ms).toFixed(1) + 'px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'rgba(10,13,20,0.65)';
     ctx.beginPath();
-    ctx.arc(mid.x, mid.y, 8, 0, Math.PI * 2);
+    ctx.arc(mid.x, mid.y, 8 * ms, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = '#fff';
     ctx.fillText(glyph, mid.x, mid.y + 0.5);
@@ -2876,6 +2994,8 @@ self.onmessage = function (e) {
     if (!state.terrain || !state.ports) return;
     const portSet = currentBoatPortSet();
     if (portSet.size === 0) return;
+    const ms = Math.max(0.8, markerScale());
+    const pr = 4.5 * ms;
     ctx.save();
     portSet.forEach(function (i) {
       const p = state.ports[i];
@@ -2883,15 +3003,15 @@ self.onmessage = function (e) {
       // small port ring
       ctx.beginPath();
       ctx.fillStyle = 'rgba(10,13,20,0.6)';
-      ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, pr, 0, Math.PI * 2);
       ctx.fill();
       ctx.beginPath();
       ctx.strokeStyle = 'rgba(56,189,248,0.8)';
       ctx.lineWidth = 1.1;
-      ctx.arc(p.x, p.y, 4.5, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, pr, 0, Math.PI * 2);
       ctx.stroke();
       // anchor glyph
-      ctx.font = '7px sans-serif';
+      ctx.font = (7 * ms).toFixed(1) + 'px sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#dff2ff';
@@ -2901,28 +3021,29 @@ self.onmessage = function (e) {
   }
 
   function drawCities() {
+    const ms = markerScale();
     for (let idx = 0; idx < state.cities.length; idx++) {
       const c = state.cities[idx];
       const isStart = idx === 0;
       ctx.beginPath();
       ctx.shadowColor = isStart ? START_COLOR : CITY_COLOR;
-      ctx.shadowBlur = isStart ? 16 : 9;
+      ctx.shadowBlur = (isStart ? 16 : 9) * ms;
       ctx.fillStyle = isStart ? START_COLOR : CITY_COLOR;
-      ctx.arc(c.x, c.y, isStart ? 6 : 4.5, 0, Math.PI * 2);
+      ctx.arc(c.x, c.y, (isStart ? 6 : 4.5) * ms, 0, Math.PI * 2);
       ctx.fill();
       ctx.shadowBlur = 0;
       if (isStart) {
         ctx.beginPath();
         ctx.strokeStyle = START_COLOR;
         ctx.lineWidth = 2;
-        ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
+        ctx.arc(c.x, c.y, 10 * ms, 0, Math.PI * 2);
         ctx.stroke();
       }
       if (isCityCoastal(c)) {
         ctx.beginPath();
         ctx.strokeStyle = 'rgba(56,189,248,0.9)';
         ctx.lineWidth = 1.5;
-        ctx.arc(c.x, c.y, isStart ? 10 : 7.5, 0, Math.PI * 2);
+        ctx.arc(c.x, c.y, (isStart ? 10 : 7.5) * ms, 0, Math.PI * 2);
         ctx.stroke();
       }
     }
@@ -3078,7 +3199,21 @@ self.onmessage = function (e) {
     compareCardGA.classList.toggle('active', state.algo === 'ga');
     compareCardTwoOpt.classList.toggle('active', state.algo === '2opt');
     compareCardNN.classList.toggle('active', state.algo === 'nn');
+
+    // Screen-reader announcement of the best-tour length. Rounded + change-gated
+    // so a polite live region isn't spammed every rAF; it only speaks when the
+    // rounded best distance actually moves.
+    if (srStatus) {
+      const rounded = state.bestDistance != null ? Math.round(state.bestDistance) : null;
+      if (rounded !== lastAnnouncedBest) {
+        lastAnnouncedBest = rounded;
+        srStatus.textContent = rounded != null
+          ? ('Best tour length ' + rounded + ' across ' + state.cities.length + ' cities')
+          : '';
+      }
+    }
   }
+  let lastAnnouncedBest = null;
 
   // =========================================================================
   // UI wiring
@@ -3088,6 +3223,7 @@ self.onmessage = function (e) {
 
   function updatePlayButton() {
     playBtn.innerHTML = state.running ? '&#10074;&#10074; Pause' : '&#9654; Play';
+    playBtn.setAttribute('aria-label', state.running ? 'Pause' : 'Play');
   }
 
   canvas.addEventListener('click', function (e) {
@@ -3194,7 +3330,26 @@ self.onmessage = function (e) {
 
   mapLegendToggle.addEventListener('click', function () {
     mapLegend.classList.toggle('collapsed');
-    mapLegendToggle.innerHTML = mapLegend.classList.contains('collapsed') ? 'Transport &#9656;' : 'Transport &#9662;';
+    const collapsed = mapLegend.classList.contains('collapsed');
+    mapLegendToggle.innerHTML = collapsed ? 'Transport &#9656;' : 'Transport &#9662;';
+    mapLegendToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  });
+
+  // ---- Mobile control drawer (bottom sheet). Purely a CSS-class toggle on
+  // <body>; the panel, scrim and toggle only exist visually below the mobile
+  // breakpoint, so this is a no-op affordance on desktop. ----
+  function setDrawer(open) {
+    document.body.classList.toggle('drawer-open', open);
+    if (drawerToggle) drawerToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  if (drawerToggle) {
+    drawerToggle.addEventListener('click', function () {
+      setDrawer(!document.body.classList.contains('drawer-open'));
+    });
+  }
+  if (drawerScrim) drawerScrim.addEventListener('click', function () { setDrawer(false); });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') setDrawer(false);
   });
 
   playBtn.addEventListener('click', function () {
@@ -3370,41 +3525,6 @@ self.onmessage = function (e) {
     renderChart();
     updateStatsUI();
   }
-
-  // Read-only diagnostics hook for automated verification only; recomputes on
-  // demand and does not affect rendering or state.
-  window.__tspDebug = {
-    portStats: function () {
-      return { cityCount: state.cities.length, portCount: currentBoatPortSet().size, mode: state.transportMode };
-    },
-    // ---- zoom/pan diagnostics + drivers (verification only) ----
-    getView: function () {
-      return { scale: view.scale, offsetX: view.offsetX, offsetY: view.offsetY, minScale: view.minScale, maxScale: view.maxScale };
-    },
-    setView: function (scale, offsetX, offsetY) {
-      view.scale = scale; view.offsetX = offsetX; view.offsetY = offsetY;
-      clampView(); updateViewUI();
-      return this.getView();
-    },
-    zoomAt: function (sx, sy, factor) { zoomAt(sx, sy, factor); return this.getView(); },
-    resetView: function () { resetView(); return this.getView(); },
-    screenToWorld: function (sx, sy) { return screenToWorld(sx, sy); },
-    cityCount: function () { return state.cities.length; },
-    lastCity: function () {
-      const c = state.cities[state.cities.length - 1];
-      return c ? { x: c.x, y: c.y } : null;
-    },
-    // Mirrors the real click handler: maps a canvas-screen point through the
-    // inverse view transform and drops a city there (rejecting water), so a
-    // probe can prove click-at-zoom lands at the correct world location.
-    addCityAtScreen: function (sx, sy) {
-      const wpt = screenToWorld(sx, sy);
-      if (isWaterAtPoint(wpt.x, wpt.y)) return { placed: false, reason: 'water', world: wpt };
-      applyCities(state.cities.slice().concat([{ x: wpt.x, y: wpt.y }]));
-      const c = state.cities[state.cities.length - 1];
-      return { placed: true, world: wpt, city: { x: c.x, y: c.y } };
-    }
-  };
 
   // =========================================================================
   // Boot
