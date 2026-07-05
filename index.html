@@ -106,6 +106,10 @@
     width:100%;
     height:100%;
     cursor:crosshair;
+    /* We drive wheel-zoom and one-finger pan ourselves via pointer events, so
+       stop the browser from hijacking touch gestures (scroll / native pinch)
+       on the canvas — otherwise a drag-to-pan would scroll the page instead. */
+    touch-action:none;
   }
 
   .instructions{
@@ -130,6 +134,84 @@
     transform:translateX(-50%) translateY(-8px);
   }
   .instructions b{ color:var(--accent); }
+
+  /* ---------- Map overlays: transport legend + reset-view ---------- */
+  /* Compact, unobtrusive corner overlay explaining the route colors/modes.
+     HTML/CSS (not canvas) so it stays crisp under zoom and never gets baked
+     into the transformed cached layers. Colors mirror MODE_COLORS in the JS. */
+  .map-legend{
+    position:absolute;
+    right:12px;
+    bottom:12px;
+    background:rgba(19,24,38,0.92);
+    border:1px solid var(--border);
+    border-radius:10px;
+    box-shadow:var(--shadow);
+    font-size:11px;
+    color:var(--text);
+    overflow:hidden;
+    max-width:46%;
+    z-index:3;
+  }
+  .map-legend-toggle{
+    display:block;
+    width:100%;
+    text-align:left;
+    background:transparent;
+    border:none;
+    border-radius:0;
+    padding:7px 11px;
+    font-size:10.5px;
+    font-weight:700;
+    letter-spacing:0.6px;
+    text-transform:uppercase;
+    color:var(--muted);
+  }
+  .map-legend-toggle:hover{ background:rgba(255,255,255,0.04); }
+  .map-legend-body{
+    display:flex;
+    flex-direction:column;
+    gap:5px;
+    padding:2px 11px 10px;
+  }
+  .map-legend.collapsed .map-legend-body{ display:none; }
+  .map-legend-row{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    white-space:nowrap;
+    line-height:1.5;
+  }
+  .map-legend-row i{
+    width:14px;
+    height:3px;
+    border-radius:2px;
+    display:inline-block;
+    flex:0 0 auto;
+  }
+  .map-legend-row i.dot{
+    width:8px;
+    height:8px;
+    border-radius:50%;
+  }
+
+  .reset-view-btn{
+    position:absolute;
+    top:12px;
+    right:12px;
+    padding:7px 11px;
+    font-size:12px;
+    background:rgba(19,24,38,0.92);
+    box-shadow:var(--shadow);
+    z-index:3;
+    display:none;
+  }
+  .reset-view-btn.visible{ display:block; }
+
+  @media (max-width: 560px){
+    .map-legend{ font-size:10px; right:8px; bottom:8px; }
+    .map-legend-row i{ width:12px; }
+  }
 
   /* ---------- Side panel ---------- */
   .panel{
@@ -370,7 +452,20 @@
     <div class="map-wrap" id="mapWrap">
       <canvas id="mapCanvas"></canvas>
       <div class="instructions" id="instructions">
-        Click the map to drop cities, or hit <b>Random Cities</b>, then press <b>Play</b>.
+        Click the map to drop cities, or hit <b>Random Cities</b>, then press <b>Play</b>. Scroll to zoom, drag to pan.
+      </div>
+
+      <button class="reset-view-btn" id="resetViewBtn" title="Reset zoom &amp; pan">&#10530; Reset view</button>
+
+      <div class="map-legend" id="mapLegend">
+        <button class="map-legend-toggle" id="mapLegendToggle">Transport &#9662;</button>
+        <div class="map-legend-body" id="mapLegendBody">
+          <span class="map-legend-row"><i style="background:#f5a623;"></i>&#128663; Highway</span>
+          <span class="map-legend-row"><i style="background:#9b6bff;"></i>&#128646; Train</span>
+          <span class="map-legend-row"><i style="background:#38bdf8;"></i>&#9972; Boat</span>
+          <span class="map-legend-row"><i class="dot" style="background:#38bdf8;"></i>&#9875; Port / dock</span>
+          <span class="map-legend-row"><i style="background:#ff6b9d;"></i>&#9992; Plane</span>
+        </div>
       </div>
     </div>
 
@@ -557,6 +652,9 @@
   let ctx = canvas.getContext('2d');
   const mapWrap = document.getElementById('mapWrap');
   const instructions = document.getElementById('instructions');
+  const resetViewBtn = document.getElementById('resetViewBtn');
+  const mapLegend = document.getElementById('mapLegend');
+  const mapLegendToggle = document.getElementById('mapLegendToggle');
 
   const chartCanvas = document.getElementById('convergenceChart');
   const chartCtx = chartCanvas.getContext('2d');
@@ -693,6 +791,63 @@
     // ---- render caching (perf) ----
     routeLayerDirty: true   // when true, the offscreen route layer (best tour + routed multimodal paths + ports + city glyphs) is re-rendered on the next frame; otherwise animate() just blits the cached layer. Set true wherever the tour, cities, terrain, transport mode, ports, or canvas size change (mirrors the terrain cache's invalidation, but flag-driven so the rAF loop consumes it). See renderRouteLayer().
   };
+
+  // =========================================================================
+  // View transform: zoom + pan. Cities live in "world" coordinates (== the
+  // canvas CSS-pixel space at scale 1). The view maps world -> screen as
+  //   screen = world * scale + offset
+  // and is applied ONLY at compositing time in render() (translate+scale the
+  // main ctx before blitting the cached terrain + route layers), so zoom/pan
+  // never re-renders the offscreen caches — it's a cheap transformed blit.
+  // Every screen->world conversion (city placement, water hit-testing, pulses)
+  // must go through screenToWorld() so clicks land under the cursor at any
+  // zoom/pan. minScale = 1 (fit): you can't zoom out past the full map, and
+  // offsets are clamped so the map always fills the viewport.
+  // =========================================================================
+  const view = { scale: 1, minScale: 1, maxScale: 8, offsetX: 0, offsetY: 0 };
+
+  function screenToWorld(sx, sy) {
+    return { x: (sx - view.offsetX) / view.scale, y: (sy - view.offsetY) / view.scale };
+  }
+
+  // Keep scale within [minScale, maxScale] and offsets clamped so the scaled
+  // map never pulls away from a viewport edge (no empty gutters). At scale 1
+  // this pins offset to (0,0) — identity.
+  function clampView() {
+    const w = canvas.clientWidth || 1, h = canvas.clientHeight || 1;
+    if (view.scale < view.minScale) view.scale = view.minScale;
+    if (view.scale > view.maxScale) view.scale = view.maxScale;
+    const minX = w * (1 - view.scale), minY = h * (1 - view.scale);
+    if (view.offsetX > 0) view.offsetX = 0; else if (view.offsetX < minX) view.offsetX = minX;
+    if (view.offsetY > 0) view.offsetY = 0; else if (view.offsetY < minY) view.offsetY = minY;
+  }
+
+  function resetView() {
+    view.scale = view.minScale;
+    view.offsetX = 0;
+    view.offsetY = 0;
+    updateViewUI();
+  }
+
+  // Zoom by a multiplicative factor while keeping the world point currently
+  // under (sx, sy) — a screen coordinate relative to the canvas — pinned there.
+  function zoomAt(sx, sy, factor) {
+    const before = screenToWorld(sx, sy);
+    view.scale *= factor;
+    if (view.scale < view.minScale) view.scale = view.minScale;
+    if (view.scale > view.maxScale) view.scale = view.maxScale;
+    view.offsetX = sx - before.x * view.scale;
+    view.offsetY = sy - before.y * view.scale;
+    clampView();
+    updateViewUI();
+  }
+
+  // Show the reset-view affordance only while the view is actually zoomed/panned.
+  function updateViewUI() {
+    if (!resetViewBtn) return;
+    const zoomed = view.scale > view.minScale + 1e-4;
+    resetViewBtn.classList.toggle('visible', zoomed);
+  }
 
   // =========================================================================
   // Worker source: the GA, 2-opt, nearest-neighbor, and terrain-aware costing
@@ -2431,6 +2586,10 @@ self.onmessage = function (e) {
     // The canvas backing store changed size — the cached route layer must be
     // resized (in sizeRouteLayer) and repainted to match.
     state.routeLayerDirty = true;
+    // The viewport changed size, so pan clamps (which depend on w/h) may now be
+    // violated — re-clamp and refresh the reset-view affordance.
+    clampView();
+    updateViewUI();
   }
 
   if (window.ResizeObserver) {
@@ -2789,6 +2948,21 @@ self.onmessage = function (e) {
     const h = canvas.clientHeight || 1;
     ctx.clearRect(0, 0, w, h);
 
+    // Re-render the cached route layer (if stale) BEFORE applying the view
+    // transform: renderRouteLayer() paints into its own offscreen context at
+    // its own DPR transform and never touches the main ctx's transform, so it's
+    // order-independent — doing it here keeps the transformed block below to
+    // just cheap blits.
+    if (state.routeLayerDirty) renderRouteLayer();
+
+    // Apply the zoom/pan view transform, then composite BOTH cached layers
+    // (terrain + route) and the world-space transients under it, so everything
+    // moves/scales together. This is a compositing-time transform only — the
+    // offscreen caches are unchanged (that's what keeps zoom/pan at ~60fps).
+    ctx.save();
+    ctx.translate(view.offsetX, view.offsetY);
+    ctx.scale(view.scale, view.scale);
+
     if (state.terrain) {
       drawTerrainBackground(w, h);
     } else {
@@ -2798,17 +2972,21 @@ self.onmessage = function (e) {
     }
 
     // Best tour + routed multimodal paths + ports + city glyphs live on the
-    // cached route layer (see renderRouteLayer). Re-render it only when it's
-    // gone stale (a better tour arrived, cities/terrain/mode/size changed),
-    // then blit it — this is what keeps large city counts at ~60fps instead of
-    // re-stroking every leg every frame. The ghost tour and the "watch it
-    // untangle" improvements both re-render the layer on the frames they land.
-    if (state.routeLayerDirty) renderRouteLayer();
+    // cached route layer (see renderRouteLayer). It's re-rendered only when
+    // stale (a better tour arrived, cities/terrain/mode/size changed); here we
+    // just blit it under the view transform — this is what keeps large city
+    // counts at ~60fps instead of re-stroking every leg every frame.
     ctx.drawImage(routeLayer, 0, 0, w, h);
 
-    // Live per-frame transients stay on the visible canvas.
+    // Live per-frame transients that are anchored in world space (the
+    // rejected-click "ocean flash" pulses) ride the same transform so they land
+    // exactly under the cursor at any zoom/pan.
     drawRejectedPulses();
 
+    ctx.restore();
+
+    // Centered hint text is a screen-space overlay (drawn OUTSIDE the transform)
+    // so it stays centered in the viewport regardless of zoom/pan.
     if (state.cities.length === 0) {
       drawCenteredText('Click anywhere to drop your first city', w, h);
     } else if (state.cities.length < 3) {
@@ -2913,14 +3091,110 @@ self.onmessage = function (e) {
   }
 
   canvas.addEventListener('click', function (e) {
+    // A drag-pan (or pinch) ends by firing a click; swallow that one so a pan
+    // gesture never accidentally drops a city.
+    if (suppressClick) { suppressClick = false; return; }
     const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    // Screen -> world through the inverse view transform, so a city lands
+    // exactly under the cursor at any zoom/pan.
+    const wpt = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    const x = wpt.x, y = wpt.y;
     if (isWaterAtPoint(x, y)) {
       spawnRejectedPulse(x, y);
       return;
     }
     applyCities(state.cities.slice().concat([{ x: x, y: y }]));
+  });
+
+  // =========================================================================
+  // Zoom & pan input. Wheel zooms toward the cursor; one-pointer drag pans
+  // (mouse or single-finger touch); two pointers pinch-zoom. All of it feeds
+  // the `view` transform consumed in render(); nothing re-renders the caches.
+  // =========================================================================
+  const pointers = new Map(); // pointerId -> { x, y } in canvas-screen coords
+  let panning = false, panMoved = false;
+  let panStartX = 0, panStartY = 0, panStartOffX = 0, panStartOffY = 0;
+  let pinchPrevDist = 0;
+  let suppressClick = false;
+  const PAN_THRESHOLD = 5; // px of movement before a press becomes a pan (not a click)
+
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    // Scroll up (deltaY < 0) zooms in. Exponential factor -> smooth, framerate-
+    // independent zoom that's symmetric in and out.
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    zoomAt(sx, sy, factor);
+  }, { passive: false });
+
+  canvas.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    const rect = canvas.getBoundingClientRect();
+    pointers.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top });
+    if (pointers.size === 2) {
+      // Second finger down: start a pinch, cancel any single-pointer pan.
+      panning = false;
+      const pts = Array.from(pointers.values());
+      pinchPrevDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    } else if (pointers.size === 1) {
+      panning = true;
+      panMoved = false;
+      panStartX = e.clientX;
+      panStartY = e.clientY;
+      panStartOffX = view.offsetX;
+      panStartOffY = view.offsetY;
+    }
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    const rect = canvas.getBoundingClientRect();
+    const p = pointers.get(e.pointerId);
+    if (p) { p.x = e.clientX - rect.left; p.y = e.clientY - rect.top; }
+
+    if (pointers.size === 2) {
+      // Pinch-zoom toward the midpoint of the two fingers.
+      const pts = Array.from(pointers.values());
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      if (pinchPrevDist > 0 && dist > 0) {
+        const midX = (pts[0].x + pts[1].x) / 2, midY = (pts[0].y + pts[1].y) / 2;
+        zoomAt(midX, midY, dist / pinchPrevDist);
+      }
+      pinchPrevDist = dist;
+      suppressClick = true;
+      return;
+    }
+
+    if (!panning) return;
+    const dx = e.clientX - panStartX, dy = e.clientY - panStartY;
+    if (!panMoved && Math.hypot(dx, dy) < PAN_THRESHOLD) return;
+    // Nothing to pan at fit-scale — leave the press as a click-to-place.
+    if (view.scale <= view.minScale + 1e-6) return;
+    panMoved = true;
+    suppressClick = true;
+    canvas.style.cursor = 'grabbing';
+    view.offsetX = panStartOffX + dx;
+    view.offsetY = panStartOffY + dy;
+    clampView();
+  });
+
+  function endPointer(e) {
+    if (pointers.has(e.pointerId)) pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinchPrevDist = 0;
+    if (pointers.size === 0) {
+      panning = false;
+      canvas.style.cursor = '';
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  resetViewBtn.addEventListener('click', function () { resetView(); });
+
+  mapLegendToggle.addEventListener('click', function () {
+    mapLegend.classList.toggle('collapsed');
+    mapLegendToggle.innerHTML = mapLegend.classList.contains('collapsed') ? 'Transport &#9656;' : 'Transport &#9662;';
   });
 
   playBtn.addEventListener('click', function () {
@@ -3102,6 +3376,33 @@ self.onmessage = function (e) {
   window.__tspDebug = {
     portStats: function () {
       return { cityCount: state.cities.length, portCount: currentBoatPortSet().size, mode: state.transportMode };
+    },
+    // ---- zoom/pan diagnostics + drivers (verification only) ----
+    getView: function () {
+      return { scale: view.scale, offsetX: view.offsetX, offsetY: view.offsetY, minScale: view.minScale, maxScale: view.maxScale };
+    },
+    setView: function (scale, offsetX, offsetY) {
+      view.scale = scale; view.offsetX = offsetX; view.offsetY = offsetY;
+      clampView(); updateViewUI();
+      return this.getView();
+    },
+    zoomAt: function (sx, sy, factor) { zoomAt(sx, sy, factor); return this.getView(); },
+    resetView: function () { resetView(); return this.getView(); },
+    screenToWorld: function (sx, sy) { return screenToWorld(sx, sy); },
+    cityCount: function () { return state.cities.length; },
+    lastCity: function () {
+      const c = state.cities[state.cities.length - 1];
+      return c ? { x: c.x, y: c.y } : null;
+    },
+    // Mirrors the real click handler: maps a canvas-screen point through the
+    // inverse view transform and drops a city there (rejecting water), so a
+    // probe can prove click-at-zoom lands at the correct world location.
+    addCityAtScreen: function (sx, sy) {
+      const wpt = screenToWorld(sx, sy);
+      if (isWaterAtPoint(wpt.x, wpt.y)) return { placed: false, reason: 'water', world: wpt };
+      applyCities(state.cities.slice().concat([{ x: wpt.x, y: wpt.y }]));
+      const c = state.cities[state.cities.length - 1];
+      return { placed: true, world: wpt, city: { x: c.x, y: c.y } };
     }
   };
 
@@ -3138,6 +3439,7 @@ self.onmessage = function (e) {
     handleCitiesChanged();
   }
   updatePlayButton();
+  updateViewUI();
   speedValue.textContent = rateLabel(state.targetRate);
   updateStatsUI();
   requestAnimationFrame(animate);
