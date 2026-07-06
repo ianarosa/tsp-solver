@@ -680,6 +680,9 @@
             <option value="japan">Japan — Shinkansen</option>
             <option value="europe">Europe — capitals &amp; rail</option>
             <option value="usa">USA — metros &amp; interstates</option>
+            <option value="uk">UK &amp; Ireland — rail</option>
+            <option value="india">India — rail (Golden Quadrilateral)</option>
+            <option value="world">World — major cities &amp; air routes</option>
           </select>
         </label>
         <div class="hint" id="realPlaceHint">Pick a region to compare the AI's optimized loop (left) against the real transport network (right).</div>
@@ -985,6 +988,98 @@
         [4,9],[9,10],        // I-80/I-25: Chicago–Denver–Phoenix
         [7,10],[10,11],      // I-10: Houston–Phoenix–Los Angeles
         [11,12],[12,13]      // I-5: LA–San Francisco–Seattle
+      ]
+    },
+    uk: {
+      label: 'UK & Ireland — rail',
+      netLabel: 'main-line rail corridors',
+      cities: [
+        { name: 'London',      lat: 51.51, lon: -0.13 }, // 0
+        { name: 'Birmingham',  lat: 52.48, lon: -1.90 }, // 1
+        { name: 'Manchester',  lat: 53.48, lon: -2.24 }, // 2
+        { name: 'Liverpool',   lat: 53.41, lon: -2.99 }, // 3
+        { name: 'Leeds',       lat: 53.80, lon: -1.55 }, // 4
+        { name: 'Sheffield',   lat: 53.38, lon: -1.47 }, // 5
+        { name: 'Newcastle',   lat: 54.98, lon: -1.61 }, // 6
+        { name: 'Edinburgh',   lat: 55.95, lon: -3.19 }, // 7
+        { name: 'Glasgow',     lat: 55.86, lon: -4.25 }, // 8
+        { name: 'Cardiff',     lat: 51.48, lon: -3.18 }, // 9
+        { name: 'Bristol',     lat: 51.45, lon: -2.59 }, // 10
+        { name: 'Southampton', lat: 50.90, lon: -1.40 }, // 11
+        { name: 'Dublin',      lat: 53.35, lon: -6.26 }, // 12
+        { name: 'Belfast',     lat: 54.60, lon: -5.93 }  // 13
+      ],
+      // West Coast + East Coast + Great Western main lines, cross-Pennine links,
+      // and the Dublin–Belfast line (no invented Irish Sea rail link).
+      edges: [
+        [0,1],[1,2],[2,3],[2,8], // West Coast: London–Birmingham–Manchester–Liverpool, Manchester–Glasgow
+        [0,4],[4,6],[6,7],       // East Coast: London–Leeds–Newcastle–Edinburgh
+        [0,10],[10,9],           // Great Western: London–Bristol–Cardiff
+        [0,11],                  // South Western: London–Southampton
+        [2,4],[4,5],             // Cross-Pennine: Manchester–Leeds–Sheffield
+        [7,8],                   // Edinburgh–Glasgow
+        [12,13]                  // Ireland: Dublin–Belfast
+      ]
+    },
+    india: {
+      label: 'India — rail (Golden Quadrilateral)',
+      netLabel: 'Golden Quadrilateral & diagonals',
+      cities: [
+        { name: 'Delhi',     lat: 28.61, lon: 77.21 }, // 0
+        { name: 'Mumbai',    lat: 19.08, lon: 72.88 }, // 1
+        { name: 'Kolkata',   lat: 22.57, lon: 88.36 }, // 2
+        { name: 'Chennai',   lat: 13.08, lon: 80.27 }, // 3
+        { name: 'Bengaluru', lat: 12.97, lon: 77.59 }, // 4
+        { name: 'Hyderabad', lat: 17.38, lon: 78.49 }, // 5
+        { name: 'Ahmedabad', lat: 23.03, lon: 72.58 }, // 6
+        { name: 'Pune',      lat: 18.52, lon: 73.86 }, // 7
+        { name: 'Jaipur',    lat: 26.91, lon: 75.79 }, // 8
+        { name: 'Lucknow',   lat: 26.85, lon: 80.95 }, // 9
+        { name: 'Nagpur',    lat: 21.15, lon: 79.09 }  // 10
+      ],
+      // Golden Quadrilateral loop + the two diagonals (via Nagpur) + spurs
+      edges: [
+        [0,1],[1,3],[3,2],[2,0], // Golden Quadrilateral: Delhi–Mumbai–Chennai–Kolkata–Delhi
+        [0,10],[10,3],           // Diagonal: Delhi–Nagpur–Chennai
+        [1,10],[10,2],           // Diagonal: Mumbai–Nagpur–Kolkata
+        [1,7],                   // Mumbai–Pune
+        [0,8],[8,6],[6,1],       // Western corridor: Delhi–Jaipur–Ahmedabad–Mumbai
+        [0,9],                   // Delhi–Lucknow
+        [4,3],                   // Bengaluru–Chennai
+        [1,5],[5,3]              // Hyderabad on the Mumbai–Chennai axis
+      ]
+    },
+    world: {
+      label: 'World — major cities & air routes',
+      netLabel: 'major air routes',
+      cities: [
+        { name: 'New York',    lat:  40.71, lon:  -74.01 }, // 0
+        { name: 'London',      lat:  51.51, lon:   -0.13 }, // 1
+        { name: 'Paris',       lat:  48.85, lon:    2.35 }, // 2
+        { name: 'Moscow',      lat:  55.76, lon:   37.62 }, // 3
+        { name: 'Dubai',       lat:  25.20, lon:   55.27 }, // 4
+        { name: 'Delhi',       lat:  28.61, lon:   77.21 }, // 5
+        { name: 'Singapore',   lat:   1.35, lon:  103.82 }, // 6
+        { name: 'Hong Kong',   lat:  22.32, lon:  114.17 }, // 7
+        { name: 'Tokyo',       lat:  35.68, lon:  139.77 }, // 8
+        { name: 'Sydney',      lat: -33.87, lon:  151.21 }, // 9
+        { name: 'São Paulo',   lat: -23.55, lon:  -46.63 }, // 10
+        { name: 'Los Angeles', lat:  34.05, lon: -118.24 }, // 11
+        { name: 'Johannesburg',lat: -26.20, lon:   28.05 }, // 12
+        { name: 'Cairo',       lat:  30.04, lon:   31.24 }, // 13
+        { name: 'Beijing',     lat:  39.90, lon:  116.41 }  // 14
+      ],
+      // Major intercontinental hub-and-spoke air corridors
+      edges: [
+        [0,1],[1,2],[2,4],   // NY–London–Paris–Dubai
+        [1,3],[3,14],        // London–Moscow–Beijing
+        [4,5],[5,6],         // Dubai–Delhi–Singapore
+        [6,7],[7,8],[7,14],  // Singapore–Hong Kong–Tokyo, Hong Kong–Beijing
+        [8,11],[11,0],       // Tokyo–Los Angeles–New York
+        [9,6],[9,11],        // Sydney–Singapore, Sydney–Los Angeles
+        [10,0],[10,12],      // São Paulo–New York, São Paulo–Johannesburg
+        [12,4],[12,13],      // Johannesburg–Dubai, Johannesburg–Cairo
+        [13,4],[13,1]        // Cairo–Dubai, Cairo–London
       ]
     }
   };
