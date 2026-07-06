@@ -2004,6 +2004,7 @@ function orOptLocalOpt(tour, deadline) {
   if (len < 5) return;
   let improved = true;
   while (improved) {
+    if (Date.now() > deadline) return; // hard wall-clock guard — can't be skipped by a run of "improvements"
     improved = false;
     for (let segLen = 1; segLen <= 3 && segLen < len - 1; segLen++) {
       for (let i = 0; i + segLen <= len; i++) {
@@ -2013,8 +2014,15 @@ function orOptLocalOpt(tour, deadline) {
         const after = tour[(i + segLen) % len];
         const removed = d(prev, s0) + d(s1, after) - d(prev, after);
         if (removed <= 1e-9) continue;
+        // Edges to skip as insertion targets: the segment's own interior/trailing
+        // edge (indices i..i+segLen-1) AND its LEADING edge, which is (i-1+len)%len
+        // — i.e. len-1 when i===0 (the wrap-around). Reinserting into the leading
+        // edge just rotates the tour back to itself, a zero-length no-op the delta
+        // math scores as an "improvement" (v wraps to s0), which otherwise loops
+        // forever without ever reaching the deadline check below.
+        const leadEdge = (i - 1 + len) % len;
         for (let j = 0; j < len; j++) {
-          if (j >= i - 1 && j <= i + segLen - 1) continue; // inside/adjacent to the segment
+          if (j === leadEdge || (j >= i && j <= i + segLen - 1)) continue; // inside/adjacent to the segment
           const u = tour[j];
           const v = tour[(j + 1) % len];
           const added = d(u, s0) + d(s1, v) - d(u, v);
@@ -2310,6 +2318,7 @@ self.onmessage = function (e) {
       break;
     }
     case 'instantSolve': {
+      try {
       if (n < 2) { postMessage({ type: 'instantResult', workerId: workerId, tour: null, distance: null }); break; }
       const solved = instantSolveTour();
       // Seed the currently-active live engine with the solved tour so pressing
@@ -2346,6 +2355,11 @@ self.onmessage = function (e) {
         history: eng.history.slice(),
         pathSegments: pd ? pd.segs : null, legModes: pd ? pd.modes : null, connectors: pd ? pd.connectors : null
       });
+      } catch (err) {
+        // Never leave the UI stuck on "Solving…": a null-tour instantResult still
+        // clears the main-thread instantBusy flag (see the 'instantResult' handler).
+        postMessage({ type: 'instantResult', workerId: workerId, tour: null, distance: null });
+      }
       break;
     }
   }
